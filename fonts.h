@@ -7,6 +7,12 @@
 extern "C" {
 #endif
 
+extern const lv_font_t ui_font_thai_14;
+extern const lv_font_t ui_font_thai_16;
+extern const lv_font_t ui_font_thai_20;
+extern const lv_font_t ui_font_thai_18;
+extern const lv_font_t ui_font_thai_22;
+extern const lv_font_t ui_font_thai_30;
 
 
 #ifdef __cplusplus
