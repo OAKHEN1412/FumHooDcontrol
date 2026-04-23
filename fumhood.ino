@@ -2,6 +2,8 @@
 #include <Wire.h>
 #include <RTClib.h>
 #include <lvgl.h>
+#define M5GFX_USING_REAL_LVGL
+#define LGFX_USE_V1 1
 #include "LGFX_ILI9488_S3.hpp"
 #include "ui.h" 
 #include "memory.h"
@@ -9,11 +11,11 @@
 #include "funtion_control.h"
 
 extern LGFX tft;
-// กำหนดขนาดหน้าจอตามที่คุณใช้งานจริง
+// ï¿½ï¿½Ë¹ï¿½ï¿½ï¿½Ò´Ë¹ï¿½Ò¨Íµï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ø³ï¿½ï¿½ï¿½ï¿½Ò¹ï¿½ï¿½Ô§
 #define SCREEN_WIDTH  480 
 #define SCREEN_HEIGHT 320
 
-// คำนวณขนาด Buffer (จองไว้ 1/10 ของหน้าจอเป็นค่าเริ่มต้นที่นิยมใช้)
+// ï¿½Ó¹Ç³ï¿½ï¿½Ò´ Buffer (ï¿½Í§ï¿½ï¿½ï¿½ 1/10 ï¿½Í§Ë¹ï¿½Ò¨ï¿½ï¿½ï¿½ç¹¤ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½é¹·ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½)
 const uint32_t buffer_size = (SCREEN_WIDTH * SCREEN_HEIGHT / 10);
 
 extern const lv_font_t ui_font_thai_14;
@@ -26,17 +28,24 @@ void initMemory();
 #define RX_PIN 37 
 #define TX_PIN 36
 
-void my_disp_flush( lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p )
+// --- Screensaver forward declarations ---
+#define SS_TIMEOUT_MS  (5UL * 60UL * 1000UL)
+extern unsigned long lastActivityTime;
+extern bool ss_active;
+void screensaver_exit();
+void screensaver_enter();
+
+void my_disp_flush( lv_display_t *disp, const lv_area_t *area, uint8_t *px_map )
 {
     uint32_t w = ( area->x2 - area->x1 + 1 );
     uint32_t h = ( area->y2 - area->y1 + 1 );
 
     tft.startWrite();
     tft.setAddrWindow( area->x1, area->y1, w, h );
-    tft.pushColors( ( uint16_t * )&color_p->full, w * h, true );
+    tft.pushColors( ( uint16_t * )px_map, w * h, true );
     tft.endWrite();
 
-    lv_disp_flush_ready( disp );
+    lv_display_flush_ready( disp );
 }
 
 static uint32_t my_tick(void)
@@ -62,13 +71,13 @@ static uint32_t my_tick(void)
 #define led_pump 47
 
 #include <ShiftRegister74HC595.h>
-// --- ประกาศขาตายตัวไว้ที่เดียว ---
+// --- ï¿½ï¿½Ð¡ï¿½È¢Òµï¿½Âµï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ ---
 const int SR_DATA_PIN  = 39;
 const int SR_CLOCK_PIN = 40;
 const int SR_LATCH_PIN = 41;
 
-// ใช้ชื่อตัวแปรแทนตัวเลขในคำสั่งสร้างวัตถุ
-ShiftRegister74HC595 sr(3, SR_DATA_PIN, SR_CLOCK_PIN, SR_LATCH_PIN);
+// ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Íµï¿½ï¿½ï¿½ï¿½ï¿½á·¹ï¿½ï¿½ï¿½ï¿½Å¢ã¹¤ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ò§ï¿½Ñµï¿½ï¿½
+ShiftRegister74HC595<3> sr(SR_DATA_PIN, SR_CLOCK_PIN, SR_LATCH_PIN);
 int value, digit1, digit2, digit3;
 uint8_t numberB[] = {
   B11000000,  // 0
@@ -82,13 +91,13 @@ uint8_t numberB[] = {
   B10000000,  // 8
   B10010000   // 9
 };
-// ฟังก์ชันแปลงตัวอักษรเป็นรหัสไฟ (ฉบับ Common Anode / Active Low)
+// ï¿½Ñ§ï¿½ï¿½ï¿½Ñ¹ï¿½ï¿½Å§ï¿½ï¿½ï¿½ï¿½Ñ¡ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ (ï¿½ï¿½Ñº Common Anode / Active Low)
 uint8_t getCharPattern(char c) {
-  // แปลงเป็นพิมพ์ใหญ่
+  // ï¿½ï¿½Å§ï¿½ï¿½ç¹¾ï¿½ï¿½ï¿½ï¿½ï¿½Ë­ï¿½
   if (c >= 'a' && c <= 'z') c -= 32; 
 
   switch (c) {
-    // --- ตัวเลข (ใช้ค่าเดิมที่คุณให้มา) ---
+    // --- ï¿½ï¿½ï¿½ï¿½Å¢ (ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ø³ï¿½ï¿½ï¿½ï¿½ï¿½) ---
     case '0': return B11000000;
     case '1': return B11111001;
     case '2': return B10100100;
@@ -100,34 +109,34 @@ uint8_t getCharPattern(char c) {
     case '8': return B10000000;
     case '9': return B10010000;
 
-    // --- ตัวอักษร (คำนวณใหม่ให้แล้วสำหรับ Common Anode) ---
+    // --- ï¿½ï¿½ï¿½ï¿½Ñ¡ï¿½ï¿½ (ï¿½Ó¹Ç³ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ñº Common Anode) ---
     case 'A': return B10001000; // A
     case 'B': return B10000011; // b
     case 'C': return B11000110; // C
     case 'D': return B10100001; // d
     case 'E': return B10000110; // E
     case 'F': return B10001110; // F
-    case 'G': return B10000010; // G (เหมือนเลข 6)
+    case 'G': return B10000010; // G (ï¿½ï¿½ï¿½ï¿½Í¹ï¿½Å¢ 6)
     case 'H': return B10001001; // H
-    case 'I': return B11111001; // I (เหมือนเลข 1)
+    case 'I': return B11111001; // I (ï¿½ï¿½ï¿½ï¿½Í¹ï¿½Å¢ 1)
     case 'J': return B11100001; // J
     case 'L': return B11000111; // L
     case 'N': return B10101011; // n
-    case 'O': return B11000000; // O (เหมือนเลข 0)
+    case 'O': return B11000000; // O (ï¿½ï¿½ï¿½ï¿½Í¹ï¿½Å¢ 0)
     case 'P': return B10001100; // P
     case 'R': return B10101111; // r
-    case 'S': return B10010010; // S (เหมือนเลข 5)
+    case 'S': return B10010010; // S (ï¿½ï¿½ï¿½ï¿½Í¹ï¿½Å¢ 5)
     case 'U': return B11000001; // U
     case 'Y': return B10010001; // y
     
-    // --- สัญลักษณ์อื่นๆ ---
-    case '-': return B10111111; // ขีดกลาง
-    case ' ': return B11111111; // ดับไฟทุกดวง
-    default:  return B11111111; // ดับไฟถ้าไม่รู้จัก
+    // --- ï¿½Ñ­ï¿½Ñ¡É³ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ ---
+    case '-': return B10111111; // ï¿½Õ´ï¿½ï¿½Ò§
+    case ' ': return B11111111; // ï¿½Ñºä¿·Ø¡ï¿½Ç§
+    default:  return B11111111; // ï¿½Ñºä¿¶ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ñ¡
   }
 }
 void textft(const char* text) {
-  uint8_t seg1 = B11111111; // เริ่มต้นแบบดับไฟ (Active Low)
+  uint8_t seg1 = B11111111; // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½áººï¿½Ñºï¿½ï¿½ (Active Low)
   uint8_t seg2 = B11111111;
   uint8_t seg3 = B11111111;
 
@@ -514,16 +523,23 @@ void bt() {
 
   if (millis() - lastPress > 200) {
     lastPress = millis();
-    btn_home = digitalRead(bt_1);
-    btn_time = digitalRead(bt_2);
+    btn_home  = digitalRead(bt_1);
+    btn_time  = digitalRead(bt_2);
     btn_light = digitalRead(bt_3);
-    btn_fan = digitalRead(bt_4);
-    btn_high = digitalRead(bt_5);
-    btn_pump = digitalRead(bt_7);
+    btn_fan   = digitalRead(bt_4);
+    btn_high  = digitalRead(bt_5);
+    btn_pump  = digitalRead(bt_7);
     btn_spray = digitalRead(bt_6);
-    btn_esc = digitalRead(bt_8);
-    btn_ent = digitalRead(bt_9);
-    btn_mute = digitalRead(bt_10);
+    btn_esc   = digitalRead(bt_8);
+    btn_ent   = digitalRead(bt_9);
+    btn_mute  = digitalRead(bt_10);
+
+    bool anyBtn = (btn_home||btn_time||btn_light||btn_fan||btn_high||
+                   btn_pump||btn_spray||btn_esc||btn_ent||btn_mute);
+    if (anyBtn) {
+        lastActivityTime = millis();
+        if (ss_active) { screensaver_exit(); return; }  // wake only â€” don't process press
+    }
 
     if (btn_home == 1) { stat1++; }
     if (btn_time == 1) { stat2++; }
@@ -625,11 +641,11 @@ void simple_toggle(lv_obj_t *obj,lv_obj_t *pnl, int pin) {
         if (lv_obj_has_state(obj, LV_STATE_CHECKED)) {
             lv_obj_clear_state(obj, LV_STATE_CHECKED); 
              lv_obj_clear_state(pnl, LV_STATE_CHECKED); 
-            if(obj == objects.speed){ lv_label_set_text(objects.m_fan, "อัตโนมัติ"); Serial2.println("FAN_LOW");}
+            if(obj == objects.speed){ lv_label_set_text(objects.m_fan, "LOW"); Serial2.println("FAN_LOW");}
         } else {
             lv_obj_add_state(obj, LV_STATE_CHECKED);
             lv_obj_add_state(pnl, LV_STATE_CHECKED);
-            if(obj == objects.speed){ lv_label_set_text(objects.m_fan, "ความเร็วสูง"); Serial2.println("FAN_HIGH");}
+            if(obj == objects.speed){ lv_label_set_text(objects.m_fan, "HIGH"); Serial2.println("FAN_HIGH");}
         }
         while (digitalRead(pin) == HIGH) {
             lv_timer_handler(); 
@@ -666,7 +682,7 @@ unsigned long lastPressTime[3] = {0,0,0};
 const unsigned long debounceDelay = 200;
 
 int findNext(int curIndex, int dx, int dy) {
-    // แผนผังปุ่ม (Map)
+    // á¼¹ï¿½Ñ§ï¿½ï¿½ï¿½ï¿½ (Map)
     const int buttonMap[3][3] = {
         {0, 1, 2},
         {3, 4, 5},
@@ -752,17 +768,17 @@ int findNext3x2(int curIndex, int dx, int dy) {
 }
 
 const int settingsMatrix[4][4] = {
-    {0, 1, 0, 1},  // แถว 0: Hour Start, Min Start (วนซ้ายขวาได้)
-    {2, 3, 2, 3},  // แถว 1: Hour End, Min End (วนซ้ายขวาได้)
-    {4, 5, 9, 8},  // แถว 2: Fan, Pump, Light, Spray
-    {6, 7, 8, 6}   // แถว 3: Save button (ครอบคลุมทั้งแถวล่าง)
+    {0, 1, 0, 1},  // ï¿½ï¿½ï¿½ 0: Hour Start, Min Start (Ç¹ï¿½ï¿½ï¿½Â¢ï¿½ï¿½ï¿½ï¿½ï¿½)
+    {2, 3, 2, 3},  // ï¿½ï¿½ï¿½ 1: Hour End, Min End (Ç¹ï¿½ï¿½ï¿½Â¢ï¿½ï¿½ï¿½ï¿½ï¿½)
+    {4, 5, 9, 8},  // ï¿½ï¿½ï¿½ 2: Fan, Pump, Light, Spray
+    {6, 7, 8, 6}   // ï¿½ï¿½ï¿½ 3: Save button (ï¿½ï¿½Íºï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ò§)
 };
 
 int findNextSettings(int curIdx, int dx, int dy) {
     int x = -1, y = -1;
     bool found = false;
 
-    // ค้นหาตำแหน่ง (x, y) ปัจจุบันจาก Index
+    // ï¿½ï¿½ï¿½ï¿½Òµï¿½ï¿½Ë¹ï¿½ï¿½ (x, y) ï¿½Ñ¨ï¿½ØºÑ¹ï¿½Ò¡ Index
     for(int r = 0; r < 4 && !found; r++) {
         for(int c = 0; c < 4 && !found; c++) {
             if(settingsMatrix[r][c] == curIdx) { 
@@ -773,12 +789,12 @@ int findNextSettings(int curIdx, int dx, int dy) {
         }
     }
     
-    // ถ้าไม่เจอ Index ปัจจุบัน ให้คืนค่าเดิมกลับไป
+    // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ Index ï¿½Ñ¨ï¿½ØºÑ¹ ï¿½ï¿½ï¿½ï¿½×¹ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ñºï¿½ï¿½
     if(!found) return curIdx;
 
-    // คำนวณตำแหน่งใหม่ (รองรับการกดทะลุขอบหน้าจอเพื่อวนลูปกลับมาอีกฝั่ง)
-    int nx = (x + dx + 4) % 4; // แกน X เปลี่ยนเป็น +4 และ % 4
-    int ny = (y + dy + 4) % 4; // แกน Y เปลี่ยนเป็น +4 และ % 4
+    // ï¿½Ó¹Ç³ï¿½ï¿½ï¿½Ë¹ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ (ï¿½Í§ï¿½Ñºï¿½ï¿½Ã¡ï¿½ï¿½ï¿½ï¿½Ø¢ÍºË¹ï¿½Ò¨ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ç¹ï¿½Ù»ï¿½ï¿½Ñºï¿½ï¿½ï¿½Õ¡ï¿½ï¿½ï¿½ï¿½)
+    int nx = (x + dx + 4) % 4; // á¡¹ X ï¿½ï¿½ï¿½ï¿½ï¿½Â¹ï¿½ï¿½ï¿½ï¿½ +4 ï¿½ï¿½ï¿½ % 4
+    int ny = (y + dy + 4) % 4; // á¡¹ Y ï¿½ï¿½ï¿½ï¿½ï¿½Â¹ï¿½ï¿½ï¿½ï¿½ +4 ï¿½ï¿½ï¿½ % 4
 
     return settingsMatrix[ny][nx];
 }
@@ -1100,17 +1116,17 @@ int currentIndex2 = 0;
 int getDropdownValue(lv_obj_t * obj) {
     if (obj == NULL || !lv_obj_is_valid(obj)) return 0;
 
-    // ต้องมี (char*) นำหน้า
-    char * buf = (char*)lv_mem_alloc(64); 
+    // ï¿½ï¿½Í§ï¿½ï¿½ (char*) ï¿½ï¿½Ë¹ï¿½ï¿½
+    char * buf = (char*)lv_malloc(64); 
     
     if (buf == NULL) return 0;
 
-    lv_memset_00(buf, 64);
+    lv_memset(buf, 0, 64);
     lv_dropdown_get_selected_str(obj, buf, 64);
     
     int result = atoi(buf);
 
-    lv_mem_free(buf); // อย่าลืม Free
+    lv_free(buf); // Free
 
     return result;
 }
@@ -1188,7 +1204,7 @@ void updatePgSwitch2x2() {
         if(objects.light_state)  lv_obj_clear_state(objects.light_state, LV_STATE_PRESSED);
         if(objects.spray_state)  lv_obj_clear_state(objects.spray_state, LV_STATE_PRESSED);
         
-        // --- เพิ่มการเคลียร์โฟกัสของ reserve_state ---
+        // --- ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½â¿¡ï¿½Ê¢Í§ reserve_state ---
         if(objects.reserve_state) lv_obj_clear_state(objects.reserve_state, LV_STATE_PRESSED);
 
         if(objects.bt_save)      lv_obj_clear_state(objects.bt_save, LV_STATE_PRESSED);
@@ -1206,7 +1222,7 @@ void updatePgSwitch2x2() {
             case 6: if(objects.light_state)  lv_obj_add_state(objects.light_state, LV_STATE_PRESSED); break;
             case 7: if(objects.spray_state)  lv_obj_add_state(objects.spray_state, LV_STATE_PRESSED); break;
             
-            // --- เพิ่มการวาดโฟกัสให้กับ reserve_state ---
+            // --- ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ò´â¿¡ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ñº reserve_state ---
             case 9: if(objects.reserve_state) lv_obj_add_state(objects.reserve_state, LV_STATE_PRESSED); break;
             
             case 8: if(objects.bt_save)      lv_obj_add_state(objects.bt_save, LV_STATE_PRESSED); break;
@@ -1241,7 +1257,7 @@ void updatePgSwitch2x2() {
                 else lv_obj_add_state(objects.spray_state, LV_STATE_CHECKED);
                 break;
             }
-            // --- เพิ่มการทำงานตอนกด Enter ใส่ reserve_state ---
+            // --- ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ã·Ó§Ò¹ï¿½Í¹ï¿½ï¿½ Enter ï¿½ï¿½ï¿½ reserve_state ---
             case 9: {
                 if(lv_obj_has_state(objects.reserve_state, LV_STATE_CHECKED)) lv_obj_clear_state(objects.reserve_state, LV_STATE_CHECKED);
                 else lv_obj_add_state(objects.reserve_state, LV_STATE_CHECKED);
@@ -1293,11 +1309,11 @@ void updatePgTime() {
         return; 
     }
 
-    // รายการ Dropdown ทั้งหมด (จัดเรียงตาม index จริงในจอ)
+    // ï¿½ï¿½Â¡ï¿½ï¿½ Dropdown ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ (ï¿½Ñ´ï¿½ï¿½ï¿½Â§ï¿½ï¿½ï¿½ index ï¿½ï¿½Ô§ã¹¨ï¿½)
     // 0:DD, 1:MM, 2:YY, (3:Save), 4:HH, 5:Min
     lv_obj_t* dds[] = { objects.set_dd, objects.set_mm, objects.set_yy, NULL, objects.set_hh, objects.set_min };
 
-    // 1. จัดการเมื่อ Dropdown เปิดอยู่
+    // 1. ï¿½Ñ´ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ Dropdown ï¿½ï¿½Ô´ï¿½ï¿½ï¿½ï¿½
     if(currentIndexTime != 3) {
         lv_obj_t* currObj = dds[currentIndexTime];
         if(currObj != NULL && lv_dropdown_is_open(currObj)) {
@@ -1310,7 +1326,7 @@ void updatePgTime() {
         }
     }
 
-    // 2. จัดการการเลื่อนตำแหน่ง (Navigation)
+    // 2. ï¿½Ñ´ï¿½ï¿½Ã¡ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Í¹ï¿½ï¿½ï¿½Ë¹ï¿½ï¿½ (Navigation)
     int newIndex = currentIndexTime;
     const int navDelay = 250;
     if(keyLeft == HIGH && now - lastPressTimeNew[0] > navDelay){
@@ -1331,7 +1347,7 @@ void updatePgTime() {
     }
 
     if (newIndex != currentIndexTime) {
-        // 1. ล้างสถานะ Pressed ออกจากทุก Object ในกลุ่มนี้ก่อน
+        // 1. ï¿½ï¿½Ò§Ê¶Ò¹ï¿½ Pressed ï¿½Í¡ï¿½Ò¡ï¿½Ø¡ Object ã¹¡ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Í¹
         if(objects.set_dd)   lv_obj_clear_state(objects.set_dd, LV_STATE_PRESSED);
         if(objects.set_mm)   lv_obj_clear_state(objects.set_mm, LV_STATE_PRESSED);
         if(objects.set_yy)   lv_obj_clear_state(objects.set_yy, LV_STATE_PRESSED);
@@ -1341,7 +1357,7 @@ void updatePgTime() {
 
         currentIndexTime = newIndex;
 
-        // 2. เพิ่มสถานะ Pressed ให้กับ Object ที่ถูกเลือกใหม่ด้วย Switch-Case
+        // 2. ï¿½ï¿½ï¿½ï¿½ï¿½Ê¶Ò¹ï¿½ Pressed ï¿½ï¿½ï¿½ï¿½Ñº Object ï¿½ï¿½ï¿½ï¿½Ù¡ï¿½ï¿½ï¿½Í¡ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ Switch-Case
         switch(currentIndexTime) {
             case 0: if(objects.set_dd)   lv_obj_add_state(objects.set_dd, LV_STATE_PRESSED);   break;
             case 1: if(objects.set_mm)   lv_obj_add_state(objects.set_mm, LV_STATE_PRESSED);   break;
@@ -1355,23 +1371,23 @@ if(keyEnt == HIGH) {
         wait_for_release = true; 
 
         switch(currentIndexTime) {
-            // --- กลุ่ม Dropdown (กดแล้วให้เปิด/ปิดลิสต์) ---
+            // --- ï¿½ï¿½ï¿½ï¿½ï¿½ Dropdown (ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ô´/ï¿½Ô´ï¿½ï¿½Êµï¿½) ---
             case 0: toggleDropdown(objects.set_dd);  break;
             case 1: toggleDropdown(objects.set_mm);  break;
             case 2: toggleDropdown(objects.set_yy);  break;
             case 4: toggleDropdown(objects.set_hh);  break;
             case 5: toggleDropdown(objects.set_min); break;
 
-            // --- Case 3: ปุ่ม SAVE (ทำหน้าที่รวบรวมค่าและบันทึก) ---
+            // --- Case 3: ï¿½ï¿½ï¿½ï¿½ SAVE (ï¿½ï¿½Ë¹ï¿½Ò·ï¿½ï¿½ï¿½Çºï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ÐºÑ¹ï¿½Ö¡) ---
             case 3: 
             {
                 Serial.println(F("[SYSTEM] Save Button Pressed"));
 
-                // 1. ดึงค่าจาก Dropdown แต่ละตัว (ใช้ getDropdownValue แบบ Index ที่เราทำกันไว้)
+                // 1. ï¿½Ö§ï¿½ï¿½Ò¨Ò¡ Dropdown ï¿½ï¿½ï¿½ï¿½Ðµï¿½ï¿½ (ï¿½ï¿½ï¿½ getDropdownValue áºº Index ï¿½ï¿½ï¿½ï¿½ï¿½Ò·Ó¡Ñ¹ï¿½ï¿½ï¿½)
                 int d  = getDropdownValue(objects.set_dd);
                 int m  = getDropdownValue(objects.set_mm);
-                int y  = getDropdownValue(objects.set_yy); // ปี (Mode 1)
-                int h  = getDropdownValue(objects.set_hh); // ชั่วโมง (Mode 2)
+                int y  = getDropdownValue(objects.set_yy); // ï¿½ï¿½ (Mode 1)
+                int h  = getDropdownValue(objects.set_hh); // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ (Mode 2)
                 int mn = getDropdownValue(objects.set_min);
 
                     if(objects.set_dd)  lv_dropdown_close(objects.set_dd);
@@ -1380,14 +1396,14 @@ if(keyEnt == HIGH) {
                     if(objects.set_hh)  lv_dropdown_close(objects.set_hh);
                     if(objects.set_min) lv_dropdown_close(objects.set_min);
                     
-                    vTaskDelay(10); // ให้เวลา UI คืนค่า Memory
+                    vTaskDelay(10); // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ UI ï¿½×¹ï¿½ï¿½ï¿½ Memory
 
-                    // 3. บันทึกค่าลง Memory (Preferences) และ RTC
+                    // 3. ï¿½Ñ¹ï¿½Ö¡ï¿½ï¿½ï¿½Å§ Memory (Preferences) ï¿½ï¿½ï¿½ RTC
                     saveTimeSettings(d, m, y, h, mn);
                     
-                    vTaskDelay(20); // หน่วงเวลาให้ I2C Bus นิ่ง
+                    vTaskDelay(20); // Ë¹ï¿½Ç§ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ I2C Bus ï¿½ï¿½ï¿½ï¿½
 
-                    // 4. อัปเดตตัวเลขเวลาที่แสดงบนหน้าจอทันที
+                    // 4. ï¿½Ñ»à´µï¿½ï¿½ï¿½ï¿½Å¢ï¿½ï¿½ï¿½Ò·ï¿½ï¿½ï¿½Ê´ï¿½ï¿½ï¿½Ë¹ï¿½Ò¨Í·Ñ¹ï¿½ï¿½
                     DateTime rtcNow = rtc.now();
                     static char dBuf[32], tBuf[16];
                     
@@ -1569,7 +1585,7 @@ void updateButtonSelection() {
     int btnLeft  = digitalRead(bt_3);
     int btnRight = digitalRead(bt_4);
     int btnDown  = digitalRead(bt_7);
-    // int btnUp = digitalRead(bt_6); // ตัดออกตามขอ
+    // int btnUp = digitalRead(bt_6); // ï¿½Ñ´ï¿½Í¡ï¿½ï¿½ï¿½ï¿½ï¿½
 
     unsigned long now = millis();
     int newIndex = curIndex;
@@ -1648,23 +1664,23 @@ bool wait_page_btn = false;
 bool wait_direac_btn = false;
 #define CUR_SCREEN lv_scr_act()
 void CT_mode() {
-    lv_timer_handler(); // ให้ LVGL ทำงาน background
+    lv_timer_handler(); // ï¿½ï¿½ï¿½ LVGL ï¿½Ó§Ò¹ background
     
     unsigned long now = millis();
-    lv_obj_t* activeScreen = lv_scr_act(); // ดึงหน้าจอปัจจุบันมาเช็ค
+    lv_obj_t* activeScreen = lv_scr_act(); // ï¿½Ö§Ë¹ï¿½Ò¨Í»Ñ¨ï¿½ØºÑ¹ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
 
     // ---------------------------------------------------------
-    // 1. ปุ่มเปลี่ยนหน้าหลัก (bt_1) - Global Navigation
+    // 1. ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Â¹Ë¹ï¿½ï¿½ï¿½ï¿½Ñ¡ (bt_1) - Global Navigation
     // ---------------------------------------------------------
     static bool btn1_prev = false;
     if (digitalRead(bt_1) == HIGH) {
         if (!btn1_prev) {
             btn1_prev = true;
             
-            // เช็คว่าอยู่หน้าไหน แล้วไปหน้าถัดไป
+            // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ë¹ï¿½ï¿½ï¿½Ë¹ ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ë¹ï¿½Ò¶Ñ´ï¿½ï¿½
             if (activeScreen == objects.main && objects.main != NULL) {
                 loadScreen(SCREEN_ID_PG_WORK);
-                return; // ออกจากฟังก์ชันทันที
+                return; // ï¿½Í¡ï¿½Ò¡ï¿½Ñ§ï¿½ï¿½ï¿½Ñ¹ï¿½Ñ¹ï¿½ï¿½
             } 
             else if (activeScreen == objects.pg_work && objects.pg_work != NULL) {
                 loadScreen(SCREEN_ID_PG_SENSER);
@@ -1680,26 +1696,26 @@ void CT_mode() {
     }
 
     // ---------------------------------------------------------
-    // 2. Logic แยกตามหน้าจอ (Safe Mode)
+    // 2. Logic ï¿½Â¡ï¿½ï¿½ï¿½Ë¹ï¿½Ò¨ï¿½ (Safe Mode)
     // ---------------------------------------------------------
 
-    // === หน้า MAIN ===
+    // === Ë¹ï¿½ï¿½ MAIN ===
     if (activeScreen == objects.main && objects.main != NULL) {
         state_device();
         checkModeSensor();
         
-        // ปุ่ม Mode (bt_2)
+        // ï¿½ï¿½ï¿½ï¿½ Mode (bt_2)
         static bool btn2_prev = false;
         if (digitalRead(bt_2) == HIGH) {
             if (!btn2_prev) {
                 btn2_prev = true;
-                if (objects.mode != NULL) { // เช็คก่อนใช้
+                if (objects.mode != NULL) { // ï¿½ï¿½ç¤¡ï¿½Í¹ï¿½ï¿½ï¿½
                     if (lv_obj_has_state(objects.mode, LV_STATE_CHECKED)) {
                         lv_obj_clear_state(objects.mode, LV_STATE_CHECKED);
-                        if(objects.mode_label) lv_label_set_text(objects.mode_label, "อัตโนมัติ");
+                        if(objects.mode_label) lv_label_set_text(objects.mode_label, "AUTO");
                     } else {
                         lv_obj_add_state(objects.mode, LV_STATE_CHECKED);
-                        if(objects.mode_label) lv_label_set_text(objects.mode_label, "คุมโดยตรง");
+                        if(objects.mode_label) lv_label_set_text(objects.mode_label, "DIRECT");
                     }
                 }
             }
@@ -1707,7 +1723,7 @@ void CT_mode() {
             btn2_prev = false;
         }
 
-        // การควบคุมอุปกรณ์ (Manual)
+        // ï¿½ï¿½Ã¤Çºï¿½ï¿½ï¿½ï¿½Ø»ï¿½Ã³ï¿½ (Manual)
         if (objects.mode != NULL && lv_obj_has_state(objects.mode, LV_STATE_CHECKED)) {
             simple_toggle(objects.fan,objects.panel_fan,  bt_3);
             simple_toggle(objects.light,objects.panel_light, bt_4);
@@ -1719,18 +1735,18 @@ void CT_mode() {
         }
     }
 
-    // === หน้า WORK ===
+    // === Ë¹ï¿½ï¿½ WORK ===
     else if (activeScreen == objects.pg_work && objects.pg_work != NULL) {
         updateButtonSelection();
         
-        // ปุ่ม Enter -> ไปหน้า Switch
+        // ï¿½ï¿½ï¿½ï¿½ Enter -> ï¿½ï¿½Ë¹ï¿½ï¿½ Switch
         if (btn_ent == HIGH) {
             currentDayIndex = curIndex; 
             loadScreen(SCREEN_ID_PG_SWITCH);
-            return; // สำคัญ!
+            return; // ï¿½Ó¤Ñ­!
         }
         
-        // ปุ่ม ESC -> กลับ Main
+        // ï¿½ï¿½ï¿½ï¿½ ESC -> ï¿½ï¿½Ñº Main
         if (btn_esc == HIGH && now - globalLastEscTime > 500) { 
             globalLastEscTime = now;
             loadScreen(SCREEN_ID_MAIN);
@@ -1738,17 +1754,17 @@ void CT_mode() {
         }
     }
 
-    // === หน้า SWITCH ===
+    // === Ë¹ï¿½ï¿½ SWITCH ===
     else if (activeScreen == objects.pg_switch && objects.pg_switch != NULL) {
         
-        // โหลดข้อมูลครั้งแรกที่เข้ามาหน้านี้ (ใช้ flag ช่วย)
+        // ï¿½ï¿½Å´ï¿½ï¿½ï¿½ï¿½ï¿½Å¤ï¿½ï¿½ï¿½ï¿½ï¿½Ã¡ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ë¹ï¿½Ò¹ï¿½ï¿½ (ï¿½ï¿½ï¿½ flag ï¿½ï¿½ï¿½ï¿½)
         static bool isPgSwitchLoaded = false;
         if (!isPgSwitchLoaded) {
              loadPgSwitchData();
              isPgSwitchLoaded = true;
         }
-        // หมายเหตุ: ต้องหาจังหวะ reset 'isPgSwitchLoaded' เป็น false เมื่อออกจากหน้านี้
-        // หรือใช้วิธีเรียก loadPgSwitchData() ไว้ใน create_screen_pg_switch() จะง่ายกว่า
+        // ï¿½ï¿½ï¿½ï¿½ï¿½Ëµï¿½: ï¿½ï¿½Í§ï¿½Ò¨Ñ§ï¿½ï¿½ï¿½ reset 'isPgSwitchLoaded' ï¿½ï¿½ï¿½ï¿½ false ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Í¡ï¿½Ò¡Ë¹ï¿½Ò¹ï¿½ï¿½
+        // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ô¸ï¿½ï¿½ï¿½ï¿½Â¡ loadPgSwitchData() ï¿½ï¿½ï¿½ï¿½ï¿½ create_screen_pg_switch() ï¿½Ð§ï¿½ï¿½Â¡ï¿½ï¿½ï¿½
         
         updatePgSwitch(); 
         currentSlotIndex = currentIndex;
@@ -1759,29 +1775,29 @@ void CT_mode() {
             needReloadPgSwitch = false;
         }
         
-        // ปุ่ม ESC -> กลับหน้า Work
+        // ï¿½ï¿½ï¿½ï¿½ ESC -> ï¿½ï¿½ÑºË¹ï¿½ï¿½ Work
         if (btn_esc == HIGH && now - globalLastEscTime > 500) { 
             globalLastEscTime = now;
-            isPgSwitchLoaded = false; // รีเซ็ต flag (ถ้าใช้)
+            isPgSwitchLoaded = false; // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ flag (ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½)
             loadScreen(SCREEN_ID_PG_WORK);
             return;
         }
     }
 
-    // === หน้า SET TIME ===
+    // === Ë¹ï¿½ï¿½ SET TIME ===
     else if (activeScreen == objects.set_time && objects.set_time != NULL) {
         
         static unsigned long lastUpdateUI = 0;
         if (now - lastUpdateUI > 200) { 
             lastUpdateUI = now;
-            // เช็ค NULL ก่อน set text เสมอ
+            // ï¿½ï¿½ï¿½ï¿½ NULL ï¿½ï¿½Í¹ set text ï¿½ï¿½ï¿½ï¿½
             if(objects.pg_switch_day_1) lv_label_set_text(objects.pg_switch_day_1, dayOfWeek(currentDayIndex).c_str());
             if(objects.num_save) lv_label_set_text_fmt(objects.num_save, "%d", edit_slot_id);
         }
         
         updatePgSwitch2x2();
 
-        // ปุ่ม ESC -> กลับหน้า Switch
+        // ï¿½ï¿½ï¿½ï¿½ ESC -> ï¿½ï¿½ÑºË¹ï¿½ï¿½ Switch
         if (btn_esc == HIGH && now - globalLastEscTime > 500) { 
             globalLastEscTime = now;
             needReloadPgSwitch = true;
@@ -1790,12 +1806,12 @@ void CT_mode() {
         }
     }
 
-    // === หน้า PG TIME ===
+    // === Ë¹ï¿½ï¿½ PG TIME ===
     else if (activeScreen == objects.pg_time && objects.pg_time != NULL) {
         updatePgTime(); 
     }
 
-    // === หน้า SENSOR ===
+    // === Ë¹ï¿½ï¿½ SENSOR ===
     else if (activeScreen == objects.pg_senser && objects.pg_senser != NULL) {
         
         static unsigned long lastSensorUpdate = 0;
@@ -1809,7 +1825,7 @@ void CT_mode() {
         updatePgCalibration();
         checkModeSensor();
 
-        // ปุ่ม ESC -> กลับ Main
+        // ï¿½ï¿½ï¿½ï¿½ ESC -> ï¿½ï¿½Ñº Main
         if (btn_esc == HIGH && now - globalLastEscTime > 500) {
             globalLastEscTime = now;
             loadScreen(SCREEN_ID_MAIN);
@@ -1925,20 +1941,126 @@ void led_add_state(){
     else{digitalWrite(led_pump,LOW);}
 }
 
-lv_timer_t * timer_main  = NULL; 
-lv_timer_t * timer_1     = NULL; 
-lv_timer_t * timer_2     = NULL; 
-lv_timer_t * timer_3     = NULL; 
+lv_timer_t * timer_main  = NULL;
+lv_timer_t * timer_1     = NULL;
+lv_timer_t * timer_2     = NULL;
+lv_timer_t * timer_3     = NULL;
+
+// --- Screensaver ---
+static lv_obj_t *   ss_overlay  = NULL;
+static lv_obj_t *   ss_label    = NULL;
+static lv_timer_t * ss_scroll_t = NULL;
+bool         ss_active   = false;
+unsigned long lastActivityTime = 0;
+#define SS_LABEL_SPEED 3                         // pixels per tick
+#define SS_TICK_MS     20                        // ms per tick
+
+void screensaver_scroll_cb(lv_timer_t *) {
+    if (!ss_label) return;
+    lv_coord_t x = lv_obj_get_x(ss_label);
+    x += SS_LABEL_SPEED;
+    if (x > SCREEN_WIDTH) x = -lv_obj_get_width(ss_label);
+    lv_obj_set_x(ss_label, x);
+}
+
+void screensaver_enter() {
+    if (ss_active) return;
+    ss_active = true;
+    if (!ss_overlay) {
+        ss_overlay = lv_obj_create(lv_layer_top());
+        lv_obj_set_size(ss_overlay, SCREEN_WIDTH, SCREEN_HEIGHT);
+        lv_obj_set_pos(ss_overlay, 0, 0);
+        lv_obj_set_style_bg_color(ss_overlay, lv_color_black(), LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_opa(ss_overlay, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_border_width(ss_overlay, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_radius(ss_overlay, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_pad_all(ss_overlay, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_clear_flag(ss_overlay, LV_OBJ_FLAG_SCROLLABLE);
+        ss_label = lv_label_create(ss_overlay);
+        lv_label_set_text(ss_label, "AUTOMATION CLUSTER");
+        lv_obj_set_style_text_color(ss_label, lv_color_white(), LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_text_font(ss_label, &lv_font_montserrat_30, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_align(ss_label, LV_ALIGN_LEFT_MID, -lv_obj_get_width(ss_label), 0);
+    }
+    lv_obj_clear_flag(ss_overlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_x(ss_label, -lv_obj_get_width(ss_label));
+    if (!ss_scroll_t) {
+        ss_scroll_t = lv_timer_create(screensaver_scroll_cb, SS_TICK_MS, NULL);
+    }
+}
+
+void screensaver_exit() {
+    if (!ss_active) return;
+    ss_active = false;
+    if (ss_scroll_t) { lv_timer_del(ss_scroll_t); ss_scroll_t = NULL; }
+    if (ss_overlay)  { lv_obj_add_flag(ss_overlay, LV_OBJ_FLAG_HIDDEN); }
+    lastActivityTime = millis();
+}
+
+// --- Alarm overlay (full-screen centered, stacks active alarms vertically) ---
+static lv_obj_t * alarm_overlay          = NULL;
+static lv_obj_t * alarm_disp_label[3]   = {NULL, NULL, NULL};
+static bool       alarm_active[3]        = {false, false, false};
+static const char * const alarm_label_text[3] = {"Alram_1", "Alram_2", "Alram_3"};
+
+#define ALARM_ROW_H  60
+#define ALARM_PAD    10
+
+void ensure_alarm_overlay() {
+    if (alarm_overlay != NULL) return;
+    alarm_overlay = lv_obj_create(lv_layer_top());
+    lv_obj_set_style_bg_color(alarm_overlay, lv_color_black(), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(alarm_overlay, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(alarm_overlay, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_border_color(alarm_overlay, lv_color_hex(0xFF0000), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(alarm_overlay, 10, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_all(alarm_overlay, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_clear_flag(alarm_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(alarm_overlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_size(alarm_overlay, 460, ALARM_ROW_H + ALARM_PAD * 2);
+    for (int i = 0; i < 3; i++) {
+        alarm_disp_label[i] = lv_label_create(alarm_overlay);
+        lv_label_set_text(alarm_disp_label[i], alarm_label_text[i]);
+        lv_obj_set_style_text_color(alarm_disp_label[i], lv_color_hex(0xFF0000), LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_text_font(alarm_disp_label[i], &lv_font_montserrat_40, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_size(alarm_disp_label[i], 460, ALARM_ROW_H);
+        lv_obj_set_style_text_align(alarm_disp_label[i], LV_TEXT_ALIGN_CENTER, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_opa(alarm_disp_label[i], LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_add_flag(alarm_disp_label[i], LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+void update_alarm_overlay() {
+    if (alarm_overlay == NULL) return;
+    int count = 0;
+    for (int i = 0; i < 3; i++) if (alarm_active[i]) count++;
+    if (count == 0) {
+        lv_obj_add_flag(alarm_overlay, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    lv_obj_clear_flag(alarm_overlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_height(alarm_overlay, count * ALARM_ROW_H + ALARM_PAD * (count + 1));
+    lv_obj_align(alarm_overlay, LV_ALIGN_CENTER, 0, 0);
+    int row = 0;
+    for (int i = 0; i < 3; i++) {
+        if (alarm_active[i]) {
+            lv_obj_clear_flag(alarm_disp_label[i], LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_pos(alarm_disp_label[i], 0, ALARM_PAD + row * (ALARM_ROW_H + ALARM_PAD));
+            row++;
+        } else {
+            lv_obj_add_flag(alarm_disp_label[i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
 
 void blink_specific_cb(lv_timer_t * t) {
-    lv_obj_t * obj = (lv_obj_t *)t->user_data;
-    if(obj == NULL) return;
-
-    if(lv_obj_has_state(obj, LV_STATE_CHECKED)) {
-        lv_obj_clear_state(obj, LV_STATE_CHECKED);
-    } else {
-        lv_obj_add_state(obj, LV_STATE_CHECKED);
-    }
+    intptr_t idx = (intptr_t)lv_timer_get_user_data(t);
+    if (idx < 0 || idx > 2) return;
+    if (alarm_disp_label[idx] == NULL) return;
+    lv_opa_t cur = lv_obj_get_style_opa(alarm_disp_label[idx], LV_PART_MAIN);
+    lv_obj_set_style_opa(alarm_disp_label[idx],
+        (cur >= LV_OPA_50) ? LV_OPA_TRANSP : LV_OPA_COVER,
+        LV_PART_MAIN | LV_STATE_DEFAULT);
 }
 
 void stop_blink(lv_timer_t * &tmr, lv_obj_t * obj) {
@@ -1953,34 +2075,46 @@ int leds[] = {led_fan, led_light, led_auto, led_spray, led_pump};
 int numLeds = 5;
 void Read_nano(){
             if (Serial2.available()) {
-            String incomingData = Serial2.readStringUntil('\n'); 
+            String incomingData = Serial2.readStringUntil('\n');
             incomingData.trim();
             // --- Alarm 1 ---
             if(incomingData == "Alarm_1_ON") {
-                if(timer_1 == NULL) timer_1 = lv_timer_create(blink_specific_cb, 100, objects.alram_1);
-                // if(timer_main == NULL) timer_main = lv_timer_create(blink_specific_cb, 100, objects.alram);
+                ensure_alarm_overlay();
+                alarm_active[0] = true;
+                update_alarm_overlay();
+                if(timer_1 == NULL) timer_1 = lv_timer_create(blink_specific_cb, 500, (void*)(intptr_t)0);
             }
             if(incomingData == "Alarm_1_OFF") {
                 stop_blink(timer_1, objects.alram_1);
-                // if(timer_2 == NULL && timer_3 == NULL) stop_blink(timer_main, objects.alram);
+                alarm_active[0] = false;
+                if (alarm_disp_label[0]) lv_obj_set_style_opa(alarm_disp_label[0], LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_DEFAULT);
+                update_alarm_overlay();
             }
             // --- Alarm 2 ---
             if(incomingData == "Alarm_2_ON") {
-                if(timer_2 == NULL) timer_2 = lv_timer_create(blink_specific_cb, 100, objects.alram_2);
-                // if(timer_main == NULL) timer_main = lv_timer_create(blink_specific_cb, 100, objects.alram);
+                ensure_alarm_overlay();
+                alarm_active[1] = true;
+                update_alarm_overlay();
+                if(timer_2 == NULL) timer_2 = lv_timer_create(blink_specific_cb, 500, (void*)(intptr_t)1);
             }
             if(incomingData == "Alarm_2_OFF") {
                 stop_blink(timer_2, objects.alram_2);
-                // if(timer_1 == NULL && timer_3 == NULL) stop_blink(timer_main, objects.alram);
+                alarm_active[1] = false;
+                if (alarm_disp_label[1]) lv_obj_set_style_opa(alarm_disp_label[1], LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_DEFAULT);
+                update_alarm_overlay();
             }
             // --- Alarm 3 ---
             if(incomingData == "Alarm_3_ON") {
-                if(timer_3 == NULL) timer_3 = lv_timer_create(blink_specific_cb, 100, objects.alram_3);
-                // if(timer_main == NULL) timer_main = lv_timer_create(blink_specific_cb, 100, objects.alram);
+                ensure_alarm_overlay();
+                alarm_active[2] = true;
+                update_alarm_overlay();
+                if(timer_3 == NULL) timer_3 = lv_timer_create(blink_specific_cb, 500, (void*)(intptr_t)2);
             }
             if(incomingData == "Alarm_3_OFF") {
                 stop_blink(timer_3, objects.alram_3);
-                // if(timer_1 == NULL && timer_2 == NULL) stop_blink(timer_main, objects.alram);
+                alarm_active[2] = false;
+                if (alarm_disp_label[2]) lv_obj_set_style_opa(alarm_disp_label[2], LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_DEFAULT);
+                update_alarm_overlay();
             }
         }
 }
@@ -2034,17 +2168,11 @@ void setup()
     }
     initMemory();
     lv_init();
-    static lv_disp_draw_buf_t draw_buf;
-    static lv_color_t buf[ SCREEN_WIDTH * 10 ]; 
-    lv_disp_draw_buf_init( &draw_buf, buf, NULL, SCREEN_WIDTH * 10 );
-
-    static lv_disp_drv_t disp_drv;
-    lv_disp_drv_init( &disp_drv );
-    disp_drv.hor_res = SCREEN_WIDTH;
-    disp_drv.ver_res = SCREEN_HEIGHT;
-    disp_drv.flush_cb = my_disp_flush; 
-    disp_drv.draw_buf = &draw_buf;
-    lv_disp_drv_register( &disp_drv );
+    lv_tick_set_cb(millis);
+    static lv_color_t buf[ SCREEN_WIDTH * 10 ];
+    lv_display_t *disp = lv_display_create(SCREEN_WIDTH, SCREEN_HEIGHT);
+    lv_display_set_flush_cb(disp, my_disp_flush);
+    lv_display_set_buffers(disp, buf, NULL, sizeof(buf), LV_DISPLAY_RENDER_MODE_PARTIAL);
 
     ui_init();
     Serial.println("Setup Done");
@@ -2069,9 +2197,9 @@ void setup()
     lv_obj_clear_state(objects.speed, LV_STATE_CHECKED);
     state_device();
     Serial2.println("restart");
-// delay(2000); // ให้เวลา Serial Monitor เริ่มทำงาน
+// delay(2000); // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ Serial Monitor ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ó§Ò¹
 
-//     // 1. สร้างข้อมูลจำลอง (ใช้ index 0 ถึง 5 เท่านั้น!)
+//     // 1. ï¿½ï¿½ï¿½Ò§ï¿½ï¿½ï¿½ï¿½ï¿½Å¨ï¿½ï¿½Í§ (ï¿½ï¿½ï¿½ index 0 ï¿½Ö§ 5 ï¿½ï¿½ï¿½Ò¹ï¿½ï¿½ï¿½!)
 //     ProgramData p;
 //     for(int i = 0; i < 6; i++) {
 //         p.fan[i] = 0; p.light[i] = 0; p.spray[i] = 0; p.pump[i] = 0;
@@ -2080,18 +2208,18 @@ void setup()
 //         p.state[i] = 0;
 //     }
 
-//     // 2. ลูปบันทึกข้อมูลเพื่อสร้าง Namespace ใน NVS (แก้ปัญหา NOT_FOUND)
+//     // 2. ï¿½Ù»ï¿½Ñ¹ï¿½Ö¡ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ò§ Namespace ï¿½ï¿½ NVS (ï¿½ï¿½ï¿½ï¿½Ñ­ï¿½ï¿½ NOT_FOUND)
 //     Serial.println("Starting NVS Initialization...");
-//     for (int d = 0; d <= 6; d++) {       // วันที่ 0-6 (7 วัน)
-//         for (int s = 0; s < 6; s++) {    // Slot 0-5 (ห้ามเป็น 6 เพราะจะเกิด Stack Smashing)
+//     for (int d = 0; d <= 6; d++) {       // ï¿½Ñ¹ï¿½ï¿½ï¿½ 0-6 (7 ï¿½Ñ¹)
+//         for (int s = 0; s < 6; s++) {    // Slot 0-5 (ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ 6 ï¿½ï¿½ï¿½ï¿½Ð¨ï¿½ï¿½ï¿½Ô´ Stack Smashing)
 //             saveSingleSlot(d, s, p);
-//             delay(10); // ป้องกัน Watchdog Reset
+//             delay(10); // ï¿½ï¿½Í§ï¿½Ñ¹ Watchdog Reset
 //         }
 //         Serial.printf("Day %d initialized...\n", d);
 //     }
 //     Serial.println("All NVS Data Initialized Successfully!");
 
-//     // 3. เริ่มต้น I2C ต่อจากนี้
+//     // 3. ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ I2C ï¿½ï¿½Í¨Ò¡ï¿½ï¿½ï¿½
 //     if (!rtc.begin()) {
 //         Serial.println("Couldn't find RTC");
 //     }
@@ -2105,30 +2233,30 @@ void setup()
 
 unsigned long last = 0;
 const unsigned long print = 1000;
-// --- ฟังก์ชันสำหรับ Monitor ระบบ (ใช้แทน vTaskList ที่ Error) ---
+// --- ï¿½Ñ§ï¿½ï¿½ï¿½Ñ¹ï¿½ï¿½ï¿½ï¿½Ñº Monitor ï¿½Ðºï¿½ (ï¿½ï¿½ï¿½á·¹ vTaskList ï¿½ï¿½ï¿½ Error) ---
 void printSystemStatus() {
     static uint32_t lastPrint = 0;
-    if (millis() - lastPrint < 2000) return; // แสดงผลทุก 2 วินาทีเพื่อไม่ให้รก Serial
+    if (millis() - lastPrint < 2000) return; // ï¿½Ê´ï¿½ï¿½Å·Ø¡ 2 ï¿½Ô¹Ò·ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ã¡ Serial
     lastPrint = millis();
 
     Serial.println(F("\n--- [ SYSTEM MONITOR ] ---"));
     
-    // 1. ตรวจสอบ RAM (Heap)
+    // 1. ï¿½ï¿½Ç¨ï¿½Íº RAM (Heap)
     Serial.printf("Free Heap: %u bytes\n", ESP.getFreeHeap());
-    Serial.printf("Min Free Heap: %u bytes (เคยเหลือต่ำสุด)\n", ESP.getMinFreeHeap());
+    Serial.printf("Min Free Heap: %u bytes (ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Íµï¿½ï¿½ï¿½Ø´)\n", ESP.getMinFreeHeap());
 
-    // 2. ตรวจสอบ Stack ของ loopTask (จุดที่มักจะทำให้ WDT Trigger)
-    // ถ้าตัวเลขนี้เข้าใกล้ 0 แสดงว่า Stack Overflow
+    // 2. ï¿½ï¿½Ç¨ï¿½Íº Stack ï¿½Í§ loopTask (ï¿½Ø´ï¿½ï¿½ï¿½ï¿½Ñ¡ï¿½Ð·ï¿½ï¿½ï¿½ï¿½ WDT Trigger)
+    // ï¿½ï¿½Òµï¿½ï¿½ï¿½Å¢ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ 0 ï¿½Ê´ï¿½ï¿½ï¿½ï¿½ Stack Overflow
     Serial.printf("LoopTask Stack Left: %u bytes\n", uxTaskGetStackHighWaterMark(NULL));
 
-    // 3. ตรวจสอบ Uptime
+    // 3. ï¿½ï¿½Ç¨ï¿½Íº Uptime
     Serial.printf("Uptime: %lu seconds\n", millis() / 1000);
     Serial.println(F("--------------------------"));
 }
 unsigned long mainScreenEnterTime = 0;
 bool isOnMainScreen = false;
 bool hasReadWind = false;
-// ตัวแปรสถานะปุ่ม
+// ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ê¶Ò¹Ð»ï¿½ï¿½ï¿½
 unsigned long pressStartTime_time = 0;
 bool isTime = false;
 bool isbtnTime = false;
@@ -2140,8 +2268,12 @@ void loop(){
     static uint32_t lastRTC  = 0;
     static uint32_t lastWind = 0;
     static uint32_t lastLVGL = 0;
-    static uint32_t lastTick = 0;
+    if (lastActivityTime == 0) lastActivityTime = millis();
     bt();
+    // Check screensaver timeout (skip if alarm is active)
+    if (!ss_active && (millis() - lastActivityTime >= SS_TIMEOUT_MS)) {
+        screensaver_enter();
+    }
     checkLongPress();
     checkResetButton();
      if (!isSystemOn){checkLongPress_time();}
@@ -2161,7 +2293,7 @@ void loop(){
             hasReadWind = false; 
         }
     }
-        // ส่วนของการจัดการหน้าจอหลักและฟังก์ชันที่ต้องการเงื่อนไขเพิ่มเติม
+        // ï¿½ï¿½Ç¹ï¿½Í§ï¿½ï¿½Ã¨Ñ´ï¿½ï¿½ï¿½Ë¹ï¿½Ò¨ï¿½ï¿½ï¿½Ñ¡ï¿½ï¿½Ð¿Ñ§ï¿½ï¿½ï¿½Ñ¹ï¿½ï¿½ï¿½ï¿½ï¿½Í§ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Í¹ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
     if (millis() - lastRTC >= 1000) {
         lastRTC = millis();
         timer();
@@ -2172,17 +2304,17 @@ void loop(){
                 mainScreenEnterTime = millis();
             }
             
-            // เพิ่มเงื่อนไข && hasReadWind เพื่อให้มั่นใจว่า readWind() ทำงานแล้วอย่างน้อย 1 ครั้ง
+            // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Í¹ï¿½ï¿½ && hasReadWind ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ readWind() ï¿½Ó§Ò¹ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ò§ï¿½ï¿½ï¿½ï¿½ 1 ï¿½ï¿½ï¿½ï¿½ï¿½
             if (millis() - mainScreenEnterTime > 3000 && hasReadWind) {
                 recheckupdata();
                 checkAndRunSchedule();
                 
-                // หากต้องการให้รอการอ่านค่าลมใหม่ในรอบถัดไป สามารถรีเซ็ต flag ตรงนี้ได้
+                // ï¿½Ò¡ï¿½ï¿½Í§ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Í¡ï¿½ï¿½ï¿½ï¿½Ò¹ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Íºï¿½Ñ´ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½Ã¶ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ flag ï¿½Ã§ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
                 // hasReadWind = false; 
             }
         } else {
             isOnMainScreen = false;
-            // เมื่อออกจากหน้าหลัก อาจจะต้องการรีเซ็ต flag หรือไม่ขึ้นอยู่กับความต้องการของระบบ
+            // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Í¡ï¿½Ò¡Ë¹ï¿½ï¿½ï¿½ï¿½Ñ¡ ï¿½Ò¨ï¿½Ðµï¿½Í§ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ flag ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ñºï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Í§ï¿½ï¿½Ã¢Í§ï¿½Ðºï¿½
             
         }
     }
@@ -2201,11 +2333,6 @@ void loop(){
             hasReadWind = true; 
         }
     }
-    unsigned long currentMillis = millis();
-    if (currentMillis - lastTick >= 5) {
-        lv_tick_inc(currentMillis - lastTick);
-        lastTick = currentMillis;
-    }
     if (millis() - lastLVGL >= 5) {
         lastLVGL = millis();
         lv_timer_handler();
@@ -2219,7 +2346,7 @@ void checkLongPress_time() {
             isbtnTime = true;
             pressStartTime_time = millis();
         }
-        if (!actionTriggered_time && (millis() - pressStartTime_time >= 3000)) { // ลดเหลือ 3 วิ เพื่อความไว (User Experience)
+        if (!actionTriggered_time && (millis() - pressStartTime_time >= 3000)) { // Å´ï¿½ï¿½ï¿½ï¿½ï¿½ 3 ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½Í¤ï¿½ï¿½ï¿½ï¿½ï¿½ (User Experience)
             isTime = !isTime; 
             if (isTime) {
                 tft.setBrightness(255);
@@ -2244,7 +2371,7 @@ void checkLongPress() {
             pressStartTime_btn = millis();
         }
 
-        if (!actionTriggered && (millis() - pressStartTime_btn >= 3000)) { // ลดเหลือ 3 วิ
+        if (!actionTriggered && (millis() - pressStartTime_btn >= 3000)) { // Å´ï¿½ï¿½ï¿½ï¿½ï¿½ 3 ï¿½ï¿½
             isSystemOn = !isSystemOn;
             actionTriggered = true;
 
@@ -2260,7 +2387,7 @@ void checkLongPress() {
     }
 }
 
-// --- ฟังก์ชัน Wake Up ที่แก้ไขแล้ว (ลดเวลา Blocking) ---
+// --- ï¿½Ñ§ï¿½ï¿½ï¿½Ñ¹ Wake Up ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ (Å´ï¿½ï¿½ï¿½ï¿½ Blocking) ---
 void wakeUpScreen() {
      isOnMainScreen = false;
     tft.fillScreen(TFT_BLACK);
@@ -2305,11 +2432,11 @@ void shutDownScreen() {
 
     tft.fillScreen(TFT_BLACK);
     tft.setBrightness(0);
-    sr.setAllHigh(); // Relay logic (Active LOW/HIGH?) ตรวจสอบว่า High คือปิดจริงหรือไม่
+    sr.setAllHigh(); // Relay logic (Active LOW/HIGH?) ï¿½ï¿½Ç¨ï¿½Íºï¿½ï¿½ï¿½ High ï¿½ï¿½Í»Ô´ï¿½ï¿½Ô§ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
 
     gpio_reset_pin(GPIO_NUM_1);
     pinMode(led1,INPUT);
-    // ปิด LED ทั้งหมด
+    // ï¿½Ô´ LED ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
     digitalWrite(led_time, LOW);
     digitalWrite(led_fan, LOW);
     digitalWrite(led_light, LOW);
@@ -2339,7 +2466,7 @@ void checkResetButton() {
   static unsigned long esc_start_time = 0;
   static bool is_esc_pressing = false;
 
-  // ตรวจสอบว่าปุ่มถูกกด (สมมติว่า btn_esc คือสถานะที่อ่านมาแล้ว เช่น digitalRead)
+  // ï¿½ï¿½Ç¨ï¿½Íºï¿½ï¿½Ò»ï¿½ï¿½ï¿½ï¿½Ù¡ï¿½ï¿½ (ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ btn_esc ï¿½ï¿½ï¿½Ê¶Ò¹Ð·ï¿½ï¿½ï¿½ï¿½Ò¹ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ digitalRead)
   if (btn_esc == HIGH) { 
     
     if (!is_esc_pressing) {
@@ -2347,16 +2474,16 @@ void checkResetButton() {
       esc_start_time = millis(); 
     }
 
-    // แก้ไขจาก 3000 เป็น 5000 (หน่วยเป็นมิลลิวินาที)
+    // ï¿½ï¿½ï¿½ä¢¨Ò¡ 3000 ï¿½ï¿½ï¿½ï¿½ 5000 (Ë¹ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ô¹Ò·ï¿½)
     if (millis() - esc_start_time >= 5000) {
-      Serial2.println("System Restarting..."); // แจ้งเตือนก่อนรีสตาร์ท
-      delay(100); // ให้เวลา Serial ส่งข้อมูลออกไปให้ครบก่อน
+      Serial2.println("System Restarting..."); // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Í¹ï¿½ï¿½Í¹ï¿½ï¿½Êµï¿½ï¿½ï¿½ï¿½
+      delay(100); // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ Serial ï¿½è§¢ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Í¡ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ãºï¿½ï¿½Í¹
       ESP.restart();
       
     }
     
   } else {
-    // เมื่อปล่อยปุ่ม ให้รีเซ็ตสถานะ
+    // ï¿½ï¿½ï¿½ï¿½Í»ï¿½ï¿½ï¿½Â»ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ê¶Ò¹ï¿½
     is_esc_pressing = false;
   }
 }
@@ -2377,11 +2504,11 @@ void printHardwareSpecs(HardwareSerial &serialPort) {
   serialPort.printf("Flash Speed:   %d MHz\n", ESP.getFlashChipSpeed() / 1000000);
   
   serialPort.println("--------------------------------------");
-  // ตรวจสอบ RAM ภายใน (Internal SRAM)
+  // ï¿½ï¿½Ç¨ï¿½Íº RAM ï¿½ï¿½ï¿½ï¿½ï¿½ (Internal SRAM)
   serialPort.printf("Internal RAM:  %.2f KB\n", ESP.getHeapSize() / 1024.0);
   serialPort.printf("Free Heap:     %.2f KB\n", ESP.getFreeHeap() / 1024.0);
 
-  // ตรวจสอบ PSRAM (External RAM)
+  // ï¿½ï¿½Ç¨ï¿½Íº PSRAM (External RAM)
   if (psramFound()) {
     serialPort.printf("PSRAM Size:    %ld MB\n", ESP.getPsramSize() / (1024 * 1024));
     serialPort.printf("Free PSRAM:    %ld KB\n", ESP.getFreePsram() / 1024);
@@ -2392,18 +2519,18 @@ void printHardwareSpecs(HardwareSerial &serialPort) {
 }
 void monitorSystem() {
     static uint32_t lastMon = 0;
-    if (millis() - lastMon < 2000) return; // เช็คทุก 2 วินาที
+    if (millis() - lastMon < 2000) return; // ï¿½ï¿½ç¤·Ø¡ 2 ï¿½Ô¹Ò·ï¿½
     lastMon = millis();
 
     Serial.println("--- System Monitor ---");
-    // 1. ดู RAM ที่เหลือ (Heap)
+    // 1. ï¿½ï¿½ RAM ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ (Heap)
     Serial.printf("Free Heap: %d bytes\n", ESP.getFreeHeap());
     
-    // 2. ดูค่า Stack ที่เหลือของ Task ปัจจุบัน (loopTask)
-    // ถ้าตัวเลขนี้เข้าใกล้ 0 แสดงว่า Stack กำลังจะเต็ม (Stack Overflow)
+    // 2. ï¿½Ù¤ï¿½ï¿½ Stack ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Í¢Í§ Task ï¿½Ñ¨ï¿½ØºÑ¹ (loopTask)
+    // ï¿½ï¿½Òµï¿½ï¿½ï¿½Å¢ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ 0 ï¿½Ê´ï¿½ï¿½ï¿½ï¿½ Stack ï¿½ï¿½ï¿½Ñ§ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ (Stack Overflow)
     Serial.printf("LoopTask Stack Left: %d bytes\n", uxTaskGetStackHighWaterMark(NULL));
     
-    // 3. ดูว่าตอนนี้รันอยู่ที่ CPU Core ไหน (ESP32-S3 มี 0 และ 1)
+    // 3. ï¿½ï¿½ï¿½ï¿½ÒµÍ¹ï¿½ï¿½ï¿½ï¿½Ñ¹ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ CPU Core ï¿½Ë¹ (ESP32-S3 ï¿½ï¿½ 0 ï¿½ï¿½ï¿½ 1)
     Serial.printf("Running on Core: %d\n", xPortGetCoreID());
     Serial.println("----------------------");
 }
