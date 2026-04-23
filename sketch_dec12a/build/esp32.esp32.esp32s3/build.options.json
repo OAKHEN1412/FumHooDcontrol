@@ -1,9 +1,0 @@
-{
-  "additionalFiles": "",
-  "compiler.optimization_flags": "-Os",
-  "customBuildProperties": "",
-  "fqbn": "esp32:esp32:esp32s3",
-  "hardwareFolders": "C:\\Users\\Tech3\\AppData\\Local\\Arduino15\\packages\\esp32\\hardware\\esp32\\3.3.8,C:\\Users\\Tech3\\AppData\\Local\\Arduino15\\packages\\esp32\\hardware\\esp32\\3.3.8",
-  "otherLibrariesFolders": "C:\\Users\\Tech3\\OneDrive\\เอกสาร\\Arduino\\libraries",
-  "sketchLocation": "C:\\Users\\Tech3\\OneDrive\\เอกสาร\\Arduino\\fumhood\\sketch_dec12a"
-}
