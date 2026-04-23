@@ -1,0 +1,26 @@
+# Build artifacts
+build/
+*/build/
+sketch_dec12a/build/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+sketch_dec12a/.venv/
+
+# VS Code
+.vscode/
+
+# Arduino temp files
+*.bin
+*.elf
+*.map
+*.hex
+
+# Compiled output (keep source only)
+build.options.json
+flash_args
+partitions.csv
+sdkconfig
