@@ -1,10 +1,10 @@
-#include <SoftwareSerial.h>
-#include <avr/wdt.h>
+#include <HardwareSerial.h>
+#include <esp_system.h>
 #define input_alarm_1 9
 #define input_alarm_2 10
 #define input_alarm_3 11
 
-SoftwareSerial mySerial(0, 1);  // RX=2, TX=3
+HardwareSerial mySerial(1);  // UART1: RX=0, TX=1
 
 unsigned long previousMillis = 0;
 bool ledState = LOW;
@@ -18,6 +18,9 @@ bool alarm2_triggered = false;
 bool alarm3_triggered = false;
 
 String inputBuffer = "";
+
+// *** debug: พิมพ์สถานะ pin ทุก 2 วินาที ***
+unsigned long lastStatusPrint = 0;
 
 // *** 1. เพิ่มตัวแปรสำหรับจำคำสั่งล่าสุดที่จะหน่วงเวลา ***
 String pendingFanCommand = "";
@@ -124,7 +127,7 @@ void handleAlarmBlink() {
 
 void setup() {
   Serial.begin(19200);
-  mySerial.begin(19200);
+  mySerial.begin(19200, SERIAL_8N1, 0, 1);  // UART1: RX=pin0, TX=pin1
   pinMode(2, OUTPUT);
   pinMode(3, OUTPUT);
   pinMode(4, OUTPUT);  // Pin นี้จะถูกควบคุมโดย FAN_HIGH/LOW
@@ -163,10 +166,24 @@ void loop() {
   }
 
   handleAlarmBlink();
+
+  // --- DEBUG: พิมพ์สถานะ pin ทุก 2 วินาที ---
+  if (millis() - lastStatusPrint >= 2000) {
+    lastStatusPrint = millis();
+    Serial.print("[STATUS] A1_pin=");
+    Serial.print(digitalRead(input_alarm_1) == LOW ? "LOW(active)" : "HIGH");
+    Serial.print(" trig="); Serial.print(alarm1_triggered);
+    Serial.print(" | A2_pin=");
+    Serial.print(digitalRead(input_alarm_2) == LOW ? "LOW(active)" : "HIGH");
+    Serial.print(" trig="); Serial.print(alarm2_triggered);
+    Serial.print(" | A3_pin=");
+    Serial.print(digitalRead(input_alarm_3) == LOW ? "LOW(active)" : "HIGH");
+    Serial.print(" trig="); Serial.println(alarm3_triggered);
+  }
 }
 
 
 void resetFunc() {
-  wdt_enable(WDTO_15MS); // ตั้งเวลาให้ Reset ภายใน 15 มิลลิวินาที
+  esp_restart();
   while(1); // รอจนกว่าเครื่องจะโดนสั่ง Reset
 }

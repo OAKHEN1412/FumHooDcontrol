@@ -3,7 +3,7 @@
 # ======================================================
 
 $SKETCH   = "fumhood.ino"
-$FQBN     = "esp32:esp32:esp32s3"
+$FQBN     = "esp32:esp32:esp32s3:PartitionScheme=huge_app"
 $BUILD_DIR = "C:/Temp/fumhood_build"
 $SKETCH_DIR = Split-Path -Parent $MyInvocation.MyCommand.Path
 
@@ -42,7 +42,7 @@ $compileOut | Where-Object { $_ -match "Sketch uses" } | Write-Host -ForegroundC
 # --- Step 3: Upload ---
 Write-Host "`n[3/3] Uploading to $port..." -ForegroundColor Yellow
 $binFile = "$BUILD_DIR/$SKETCH.bin"
-$uploadOut = arduino-cli upload -p $port --fqbn $FQBN --input-file $binFile 2>&1
+$uploadOut = arduino-cli upload -p $port --fqbn $FQBN --input-dir $BUILD_DIR 2>&1
 $uploadOut | Select-Object -Last 5 | ForEach-Object { Write-Host $_ }
 
 if ($LASTEXITCODE -eq 0) {

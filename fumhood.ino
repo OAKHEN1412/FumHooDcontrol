@@ -2,6 +2,13 @@
 #include <Wire.h>
 #include <RTClib.h>
 #include <lvgl.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include "esp_efuse.h"
+#include "esp_mac.h"
 #define M5GFX_USING_REAL_LVGL
 #define LGFX_USE_V1 1
 #include "LGFX_ILI9488_S3.hpp"
@@ -9,6 +16,29 @@
 #include "memory.h"
 #include "esp_system.h"
 #include "funtion_control.h"
+
+// ============ Firebase Config ============
+#define FIREBASE_DB_BASE "https://fumhood-ac-default-rtdb.asia-southeast1.firebasedatabase.app"
+
+// Device ID: 6-char uppercase hex from MAC bytes [3..5]
+// e.g. "A1B2C3"  — shown on screen so user can pair in app
+char deviceId[7] = {0};
+
+void initDeviceId() {
+  uint8_t mac[6];
+  esp_efuse_mac_get_default(mac);
+  snprintf(deviceId, sizeof(deviceId), "%02X%02X%02X", mac[3], mac[4], mac[5]);
+  Serial.printf("[Device] ID: %s\n", deviceId);
+}
+
+unsigned long lastFirebaseSend = 0;
+const unsigned long FIREBASE_INTERVAL = 5000; // send every 5 sec
+
+// ป้องกัน LVGL render ทับหน้าจอ WiFi status
+volatile bool lvglPaused = false;
+
+// NVS for storing WiFi credentials
+Preferences wifiPrefs;
 
 extern LGFX tft;
 // ï¿½ï¿½Ë¹ï¿½ï¿½ï¿½Ò´Ë¹ï¿½Ò¨Íµï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ø³ï¿½ï¿½ï¿½ï¿½Ò¹ï¿½ï¿½Ô§
@@ -78,6 +108,253 @@ const int SR_LATCH_PIN = 41;
 
 // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Íµï¿½ï¿½ï¿½ï¿½ï¿½á·¹ï¿½ï¿½ï¿½ï¿½Å¢ã¹¤ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ò§ï¿½Ñµï¿½ï¿½
 ShiftRegister74HC595<3> sr(SR_DATA_PIN, SR_CLOCK_PIN, SR_LATCH_PIN);
+
+// ============ WiFi Provisioning Global ============
+WebServer wifiServer(80);
+const char* WIFI_SSID = "Fumhood_Setup";
+const char* WIFI_PASSWORD = "12345678";
+const char* WIFI_PORTAL_URL = "http://192.168.4.1";
+bool in_wifi_prov_mode = false;
+unsigned long wifi_prov_start_time = 0;
+
+// publishNvsScheduleToFirebase defined later (used in connectToWiFi)
+void publishNvsScheduleToFirebase();
+// update_alarm_overlay defined later (used in readFirebaseCommands)
+void update_alarm_overlay();
+
+// ============ WiFi Connect from saved credentials ============
+bool connectToWiFi() {
+  wifiPrefs.begin("wifi_cred", true);
+  String ssid = wifiPrefs.getString("ssid", "");
+  String pass = wifiPrefs.getString("pass", "");
+  wifiPrefs.end();
+  
+  if (ssid.length() == 0) {
+    Serial.println("[WiFi] No saved credentials");
+    return false;
+  }
+  
+  Serial.printf("[WiFi] Connecting to: %s\n", ssid.c_str());
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid.c_str(), pass.c_str());
+  
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
+    delay(500);
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("[WiFi] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
+    publishNvsScheduleToFirebase(); // sync NVS schedule to Firebase on connect
+    return true;
+  }
+  Serial.println("[WiFi] Connection failed");
+  return false;
+}
+
+// Forward declare wind globals (defined later in this file)
+extern float smoothedWindMs;
+extern float smoothedWindFt;
+// alarm_active defined later (non-static global)
+extern bool alarm_active[3];
+
+// ============ Firebase REST - Send alarm status immediately ============
+void sendAlarmStatusImmediately() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  String url = String(FIREBASE_DB_BASE) + "/devices/" + deviceId + "/status.json";
+
+  String json = "{";
+  json += "\"alarm1\":" + String(alarm_active[0] ? "true" : "false") + ",";
+  json += "\"alarm2\":" + String(alarm_active[1] ? "true" : "false") + ",";
+  json += "\"alarm3\":" + String(alarm_active[2] ? "true" : "false");
+  json += "}";
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.begin(client, url);
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(4000);
+  int code = http.PATCH(json);
+  if (code > 0) {
+    Serial.printf("[FB] Alarm status PATCH %d: alarm1=%d alarm2=%d alarm3=%d\n", 
+                  code, alarm_active[0], alarm_active[1], alarm_active[2]);
+  } else {
+    Serial.printf("[FB] Alarm status PATCH fail: %s\n", http.errorToString(code).c_str());
+  }
+  http.end();
+}
+
+// ============ Firebase REST - Send sensor data ============
+void sendSensorData() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (millis() - lastFirebaseSend < FIREBASE_INTERVAL) return;
+  lastFirebaseSend = millis();
+
+  String url = String(FIREBASE_DB_BASE) + "/devices/" + deviceId + "/status.json";
+
+  bool f_fan      = lv_obj_has_state(objects.fan,   LV_STATE_CHECKED);
+  bool f_light    = lv_obj_has_state(objects.light, LV_STATE_CHECKED);
+  bool f_pump     = lv_obj_has_state(objects.pump,  LV_STATE_CHECKED);
+  bool f_spray    = lv_obj_has_state(objects.spray, LV_STATE_CHECKED);
+  bool f_direct   = (objects.mode != NULL) && lv_obj_has_state(objects.mode, LV_STATE_CHECKED);
+
+  String json = "{";
+  json += "\"windMs\":" + String(smoothedWindMs, 2) + ",";
+  json += "\"windFt\":" + String(smoothedWindFt, 1) + ",";
+  json += "\"online\":true,";
+  json += "\"fan\":"        + String(f_fan    ? "true" : "false") + ",";
+  json += "\"light\":"      + String(f_light  ? "true" : "false") + ",";
+  json += "\"pump\":"       + String(f_pump   ? "true" : "false") + ",";
+  json += "\"spray\":"      + String(f_spray  ? "true" : "false") + ",";
+  json += "\"directMode\":" + String(f_direct ? "true" : "false") + ",";
+  // ส่ง alarm states
+  json += "\"alarm1\":" + String(alarm_active[0] ? "true" : "false") + ",";
+  json += "\"alarm2\":" + String(alarm_active[1] ? "true" : "false") + ",";
+  json += "\"alarm3\":" + String(alarm_active[2] ? "true" : "false") + ",";
+  json += "\"lastSeen\":" + String((unsigned long)(millis() / 1000));
+  json += "}";
+  json.replace("\"timestamp\":", "\"lastSeen\":"); // backward compat
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.begin(client, url);
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(4000);
+  int code = http.PUT(json);
+  if (code > 0) {
+    Serial.printf("[FB] PUT %d\n", code);
+  } else {
+    Serial.printf("[FB] PUT fail: %s\n", http.errorToString(code).c_str());
+  }
+  http.end();
+}
+
+// ============ Firebase REST - Publish NVS schedule (7days×6slots) ============
+void publishNvsScheduleToFirebase() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  String url = String(FIREBASE_DB_BASE) + "/devices/" + deviceId + "/nvsSchedule.json";
+  String json = "{";
+  for (int d = 0; d < 7; d++) {
+    ProgramData p = loadProgram(d);
+    json += "\"" + String(d) + "\":{";
+    for (int s = 0; s < 6; s++) {
+      json += "\"" + String(s) + "\":{";
+      json += "\"hs\":"     + String(p.hour_start[s])   + ",";
+      json += "\"ms\":"     + String(p.minute_start[s]) + ",";
+      json += "\"he\":"     + String(p.hour_end[s])     + ",";
+      json += "\"me\":"     + String(p.minute_end[s])   + ",";
+      json += "\"fan\":"    + String(p.fan[s])           + ",";
+      json += "\"light\":"  + String(p.light[s])         + ",";
+      json += "\"pump\":"   + String(p.pump[s])          + ",";
+      json += "\"spray\":"  + String(p.spray[s])         + ",";
+      json += "\"reserve\":" + String(p.reserve[s])      + ",";
+      json += "\"state\":"  + String(p.state[s]);
+      json += (s < 5) ? "}," : "}";
+    }
+    json += (d < 6) ? "}," : "}";
+  }
+  json += "}";
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.begin(client, url);
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(8000);
+  int code = http.PUT(json);
+  Serial.printf("[FB] NVS schedule publish: %d\n", code);
+  http.end();
+}
+
+// ============ Firebase REST - Read commands ============
+void readFirebaseCommands() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  static unsigned long lastRead = 0;
+  if (millis() - lastRead < 1000) return;  // ← ปรับจาก 3000 เป็น 1000 ms เพื่อ sync realtime
+  lastRead = millis();
+
+  String url = String(FIREBASE_DB_BASE) + "/devices/" + deviceId + "/commands.json";
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.begin(client, url);
+  http.setTimeout(4000);
+  int code = http.GET();
+  if (code == 200) {
+    String payload = http.getString();
+    // Simple manual JSON parse for bool values
+    auto getVal = [&](const char* key) -> int {
+      String search = String("\"") + key + "\":";
+      int idx = payload.indexOf(search);
+      if (idx < 0) return -1;
+      idx += search.length();
+      while (idx < (int)payload.length() && payload[idx] == ' ') idx++;
+      if (payload.substring(idx, idx + 4) == "true")  return 1;
+      if (payload.substring(idx, idx + 5) == "false") return 0;
+      return -1;
+    };
+    int v_fan        = getVal("fan");
+    int v_light      = getVal("light");
+    int v_pump       = getVal("pump");
+    int v_spray      = getVal("spray");
+    int v_directMode = getVal("directMode"); // 1=direct, 0=auto
+    // เปลี่ยน LVGL state เฟพาะนำค่าใหม่ต่างจากเดิม = ป้องกัน relay ฟลิกเกอร์โดยไม่จำเป็น
+    auto applyIfChanged = [](lv_obj_t* obj, int newVal) {
+      if (newVal < 0 || obj == NULL) return;
+      bool cur = lv_obj_has_state(obj, LV_STATE_CHECKED);
+      bool desired = (newVal == 1);
+      if (cur != desired) {
+        if (desired) lv_obj_add_state(obj, LV_STATE_CHECKED);
+        else         lv_obj_clear_state(obj, LV_STATE_CHECKED);
+      }
+    };
+    applyIfChanged(objects.fan,   v_fan);
+    applyIfChanged(objects.light, v_light);
+    applyIfChanged(objects.pump,  v_pump);
+    applyIfChanged(objects.spray, v_spray);
+    // อัปเดต panel backgrounds ด้วย (ต้องเปลี่ยนสีพื้นหลังด้วยเมื่อปิด)
+    applyIfChanged(objects.panel_fan,   v_fan);
+    applyIfChanged(objects.panel_light, v_light);
+    applyIfChanged(objects.panel_pump,  v_pump);
+    applyIfChanged(objects.panel_spray, v_spray);
+    // directMode: ถ้าแอพสั่ง direct → set objects.mode (ปิด auto-schedule)
+    if (v_directMode >= 0 && objects.mode != NULL) {
+      bool cur_mode = lv_obj_has_state(objects.mode, LV_STATE_CHECKED);
+      bool new_mode = (v_directMode == 1);
+      if (cur_mode != new_mode) {
+        Serial.printf("[MODE] App sends directMode=%d, updating checkbox\n", v_directMode);
+        applyIfChanged(objects.mode, v_directMode);
+        if(objects.mode_label != NULL)
+          lv_label_set_text(objects.mode_label, v_directMode == 1 ? "DIRECT" : "AUTO");
+      }
+    }
+    // clearAlarms: แอพสั่งล้าง alarm ค้าง → reset alarm_active[]
+    int v_clearAlarms = getVal("clearAlarms");
+    if (v_clearAlarms == 1) {
+      Serial.println("[ALARM] clearAlarms command received, resetting all alarms");
+      for (int i = 0; i < 3; i++) {
+        if (alarm_active[i]) {
+          alarm_active[i] = false;
+        }
+      }
+      update_alarm_overlay();
+      // เคลียร์ flag clearAlarms ใน Firebase กลับเป็น false
+      String clearUrl = String(FIREBASE_DB_BASE) + "/devices/" + deviceId + "/commands/clearAlarms.json";
+      WiFiClientSecure cl2;
+      cl2.setInsecure();
+      HTTPClient hc2;
+      hc2.begin(cl2, clearUrl);
+      hc2.addHeader("Content-Type", "application/json");
+      hc2.PUT("false");
+      hc2.end();
+    }
+  }
+  http.end();
+}
+
 int value, digit1, digit2, digit3;
 uint8_t numberB[] = {
   B11000000,  // 0
@@ -1664,7 +1941,7 @@ bool wait_page_btn = false;
 bool wait_direac_btn = false;
 #define CUR_SCREEN lv_scr_act()
 void CT_mode() {
-    lv_timer_handler(); // ï¿½ï¿½ï¿½ LVGL ï¿½Ó§Ò¹ background
+    if (!lvglPaused) lv_timer_handler(); // run LVGL background
     
     unsigned long now = millis();
     lv_obj_t* activeScreen = lv_scr_act(); // ï¿½Ö§Ë¹ï¿½Ò¨Í»Ñ¨ï¿½ØºÑ¹ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
@@ -2000,7 +2277,11 @@ void screensaver_exit() {
 // --- Alarm overlay (full-screen centered, stacks active alarms vertically) ---
 static lv_obj_t * alarm_overlay          = NULL;
 static lv_obj_t * alarm_disp_label[3]   = {NULL, NULL, NULL};
-static bool       alarm_active[3]        = {false, false, false};
+// Alarm active states — non-static so Firebase send can read them
+bool alarm_active[3]        = {false, false, false};
+// Timestamp ที่จุดหาซีรีทอธ (detect การตัดจำหน่าย)
+unsigned long last_serial_read_time = 0;
+#define POWER_LOSS_TIMEOUT_MS 3500UL  // 3.5 วินาทีไม่ได้ Serial2 สัญญาณ → คงสัญญาณตัดจำหน่าย (power loss)
 static const char * const alarm_label_text[3] = {"Alram_1", "Alram_2", "Alram_3"};
 
 #define ALARM_ROW_H  60
@@ -2081,40 +2362,52 @@ void Read_nano(){
             if(incomingData == "Alarm_1_ON") {
                 ensure_alarm_overlay();
                 alarm_active[0] = true;
+                last_serial_read_time = millis();
                 update_alarm_overlay();
+                sendAlarmStatusImmediately();  // ส่ง Firebase ทันที
                 if(timer_1 == NULL) timer_1 = lv_timer_create(blink_specific_cb, 500, (void*)(intptr_t)0);
             }
             if(incomingData == "Alarm_1_OFF") {
                 stop_blink(timer_1, objects.alram_1);
                 alarm_active[0] = false;
+                last_serial_read_time = millis();
                 if (alarm_disp_label[0]) lv_obj_set_style_opa(alarm_disp_label[0], LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_DEFAULT);
                 update_alarm_overlay();
+                sendAlarmStatusImmediately();  // ส่ง Firebase ทันที
             }
             // --- Alarm 2 ---
             if(incomingData == "Alarm_2_ON") {
                 ensure_alarm_overlay();
                 alarm_active[1] = true;
+                last_serial_read_time = millis();
                 update_alarm_overlay();
+                sendAlarmStatusImmediately();  // ส่ง Firebase ทันที
                 if(timer_2 == NULL) timer_2 = lv_timer_create(blink_specific_cb, 500, (void*)(intptr_t)1);
             }
             if(incomingData == "Alarm_2_OFF") {
                 stop_blink(timer_2, objects.alram_2);
                 alarm_active[1] = false;
+                last_serial_read_time = millis();
                 if (alarm_disp_label[1]) lv_obj_set_style_opa(alarm_disp_label[1], LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_DEFAULT);
                 update_alarm_overlay();
+                sendAlarmStatusImmediately();  // ส่ง Firebase ทันที
             }
             // --- Alarm 3 ---
             if(incomingData == "Alarm_3_ON") {
                 ensure_alarm_overlay();
                 alarm_active[2] = true;
+                last_serial_read_time = millis();
                 update_alarm_overlay();
+                sendAlarmStatusImmediately();  // ส่ง Firebase ทันที
                 if(timer_3 == NULL) timer_3 = lv_timer_create(blink_specific_cb, 500, (void*)(intptr_t)2);
             }
             if(incomingData == "Alarm_3_OFF") {
                 stop_blink(timer_3, objects.alram_3);
                 alarm_active[2] = false;
+                last_serial_read_time = millis();
                 if (alarm_disp_label[2]) lv_obj_set_style_opa(alarm_disp_label[2], LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_DEFAULT);
                 update_alarm_overlay();
+                sendAlarmStatusImmediately();  // ส่ง Firebase ทันที
             }
         }
 }
@@ -2176,6 +2469,12 @@ void setup()
 
     ui_init();
     Serial.println("Setup Done");
+
+    // ---- Device ID + WiFi ----
+    initDeviceId();
+    connectToWiFi();
+    // --------------------------
+
     sr.setAllHigh();
         digitalWrite(led_time, LOW);
         digitalWrite(led_fan, LOW);
@@ -2305,6 +2604,9 @@ void loop(){
             }
             
             // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Í¹ï¿½ï¿½ && hasReadWind ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ readWind() ï¿½Ó§Ò¹ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ò§ï¿½ï¿½ï¿½ï¿½ 1 ï¿½ï¿½ï¿½ï¿½ï¿½
+            // ก่อน checkAndRunSchedule() ให้เรียก readFirebaseCommands() ก่อน
+            // เพื่อให้ directMode state ถูกอัปเดตจาก Firebase ก่อนตรวจสอบ
+            readFirebaseCommands();
             if (millis() - mainScreenEnterTime > 3000 && hasReadWind) {
                 recheckupdata();
                 checkAndRunSchedule();
@@ -2333,10 +2635,42 @@ void loop(){
             hasReadWind = true; 
         }
     }
-    if (millis() - lastLVGL >= 5) {
+    if (!lvglPaused && millis() - lastLVGL >= 5) {
         lastLVGL = millis();
         lv_timer_handler();
     }
+    // ---- WiFi auto-reconnect ----
+    static unsigned long lastWiFiCheck = 0;
+    if (millis() - lastWiFiCheck > 15000) {
+        lastWiFiCheck = millis();
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.println("[WiFi] Reconnecting...");
+            connectToWiFi();
+        }
+    }
+    // ---- Power Loss Detection ----
+    {
+      bool needUpdate = false;
+      unsigned long now_ms = millis();
+      
+      // Detect power loss: ไม่ได้สัญญาณ Serial2 เกิน 3.5 วินาที -> clear all alarms (ตัดจำหน่าย)
+      if (last_serial_read_time > 0 && (now_ms - last_serial_read_time > POWER_LOSS_TIMEOUT_MS)) {
+        // Power loss detected
+        for (int i = 0; i < 3; i++) {
+          if (alarm_active[i]) {
+            Serial.printf("[ALARM] Power loss detected - clearing alarm %d\n", i+1);
+            alarm_active[i] = false;
+            needUpdate = true;
+          }
+        }
+        last_serial_read_time = 0;  // Reset counter
+      }
+      if (needUpdate) update_alarm_overlay();
+    }
+    // ---- Firebase ----
+    sendSensorData();
+    // readFirebaseCommands(); ← ย้ายไปอยู่ด้านบนก่อน checkAndRunSchedule แล้ว
+    // ------------------
     vTaskDelay(1);
 }
 
@@ -2462,29 +2796,355 @@ void shutDownScreen() {
     hasReadWind = false;
     delay(500);
 }
+// ============ WiFi Provisioning Display ============
+// ============ WiFi Status Screen (ใช้แทน QR code) ============
+
+// วาดบรรทัด status บนหน้า WiFi
+// y = ตำแหน่ง y บนหน้าจอ, icon = emoji/char, label = ชื่อ, msg = ข้อความ, color = สีข้อความ
+void drawStatusLine(int y, const char* label, const char* msg, uint16_t color) {
+  tft.fillRect(0, y, 480, 20, TFT_BLACK);
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  tft.drawString(label, 10, y);
+  tft.setTextColor(color, TFT_BLACK);
+  tft.drawString(msg, 130, y);
+}
+
+void showWiFiProvisioningScreen() {
+  lvglPaused = true;   // หยุด LVGL render ระหว่างแสดงหน้า WiFi
+  tft.fillScreen(TFT_BLACK);
+
+  // --- หัวข้อ ---
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("WiFi Setup", 10, 10);
+
+  // --- แบ่งเส้น ---
+  tft.drawFastHLine(0, 35, 480, TFT_DARKGREY);
+
+  // --- AP Info ---
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.drawString("AP SSID:", 10, 45);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString(WIFI_SSID, 90, 45);
+
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.drawString("Password:", 10, 60);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString(WIFI_PASSWORD, 90, 60);
+
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.drawString("Portal:", 10, 75);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString(WIFI_PORTAL_URL, 90, 75);
+
+  tft.drawFastHLine(0, 92, 480, TFT_DARKGREY);
+
+  // --- หัวข้อ Status ---
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.drawString("-- Connection Status --", 10, 98);
+
+  // ---- row 1: Saved SSID ----
+  wifiPrefs.begin("wifi_cred", true);
+  String savedSSID = wifiPrefs.getString("ssid", "");
+  wifiPrefs.end();
+
+  if (savedSSID.length() > 0) {
+    String ssidMsg = "\"" + savedSSID + "\"";
+    drawStatusLine(115, "Saved SSID:", ssidMsg.c_str(), TFT_GREEN);
+  } else {
+    drawStatusLine(115, "Saved SSID:", "ยังไม่มี กรุณาตั้งค่า", TFT_RED);
+  }
+
+  // ---- row 2: WiFi Connection ----
+  drawStatusLine(132, "WiFi:", "กำลังเชื่อมต่อ...", TFT_YELLOW);
+
+  bool wifiOK = false;
+  if (savedSSID.length() > 0) {
+    wifiPrefs.begin("wifi_cred", true);
+    String savedPass = wifiPrefs.getString("pass", "");
+    wifiPrefs.end();
+
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(savedSSID.c_str(), savedPass.c_str());
+    unsigned long t = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t < 12000) {
+      delay(300);
+    }
+    wifiOK = (WiFi.status() == WL_CONNECTED);
+  }
+
+  if (wifiOK) {
+    String ipStr = "OK  " + WiFi.localIP().toString();
+    drawStatusLine(132, "WiFi:", ipStr.c_str(), TFT_GREEN);
+  } else if (savedSSID.length() == 0) {
+    drawStatusLine(132, "WiFi:", "ไม่มี credentials", TFT_DARKGREY);
+  } else {
+    drawStatusLine(132, "WiFi:", "ล้มเหลว / รหัสผ่านผิด", TFT_RED);
+  }
+
+  // ---- row 3: Password Check ----
+  if (savedSSID.length() > 0) {
+    if (wifiOK) {
+      drawStatusLine(149, "รหัสผ่าน:", "ถูกต้อง", TFT_GREEN);
+    } else {
+      drawStatusLine(149, "รหัสผ่าน:", "ผิด หรือ SSID ไม่พบ", TFT_RED);
+    }
+  } else {
+    drawStatusLine(149, "รหัสผ่าน:", "—", TFT_DARKGREY);
+  }
+
+  // ---- row 4: Firebase ----
+  drawStatusLine(166, "Firebase:", "กำลังทดสอบ...", TFT_YELLOW);
+
+  bool fbOK = false;
+  if (wifiOK) {
+    // ทดสอบ ping Firebase โดย GET ง่ายๆ ไปที่ REST endpoint
+    WiFiClientSecure client;
+    client.setInsecure(); // ไม่ต้องการ cert สำหรับ test
+    HTTPClient http;
+    String testURL = String(FIREBASE_DB_BASE) + "/ping.json";
+    http.begin(client, testURL);
+    http.setTimeout(8000);
+    int code = http.GET();
+    fbOK = (code > 0 && code < 500);
+    http.end();
+  }
+
+  if (wifiOK && fbOK) {
+    drawStatusLine(166, "Firebase:", "เชื่อมต่อได้  ส่งข้อมูลได้", TFT_GREEN);
+  } else if (wifiOK && !fbOK) {
+    drawStatusLine(166, "Firebase:", "WiFi OK แต่ Firebase ไม่ตอบ", TFT_RED);
+  } else {
+    drawStatusLine(166, "Firebase:", "ต้องเชื่อม WiFi ก่อน", TFT_DARKGREY);
+  }
+
+  // --- disconnect WiFi เพื่อเตรียม AP mode ---
+  WiFi.disconnect(true);
+  delay(300);
+
+  // ---- แถบสรุป ----
+  tft.drawFastHLine(0, 185, 480, TFT_DARKGREY);
+  tft.setTextSize(1);
+  if (wifiOK && fbOK) {
+    tft.setTextColor(TFT_GREEN, TFT_BLACK);
+    tft.drawString(">> ระบบพร้อมใช้งาน", 10, 192);
+  } else {
+    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+    tft.drawString(">> เชื่อมต่อ Fumhood_Setup แล้วเปิด 192.168.4.1", 10, 192);
+    // แสดงคำแนะนำ ENT ก็ต่อเมื่อ WiFi ไม่ผ่าน
+    tft.drawFastHLine(0, 207, 480, TFT_DARKGREY);
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    tft.drawString("[ENT] ค้าง 3 วิ  ->  เริ่ม WiFi Provisioning", 10, 213);
+  }
+
+  // ---- Device ID Box (สำหรับ Pair กับ App) ----
+  tft.drawFastHLine(0, 230, 480, TFT_DARKGREY);
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.drawString("Device ID (สำหรับจับคู่กับ App):", 10, 237);
+
+  // กล่องไฮไลต์ Device ID
+  tft.fillRoundRect(10, 252, 200, 36, 6, TFT_DARKGREY);
+  tft.drawRoundRect(10, 252, 200, 36, 6, TFT_YELLOW);
+  tft.setTextSize(3);
+  tft.setTextColor(TFT_YELLOW, TFT_DARKGREY);
+  tft.drawString(deviceId, 18, 259);
+
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("กรอกรหัสนี้ในแอพเพื่อเชื่อมต่อกับบอร์ด", 220, 265);
+
+  delay(200);
+}
+
+// ============ WiFi Portal Handler (Simplified) ============
+void handleWiFiPortal() {
+  // Simplified HTML - much smaller
+  String html = "<html><body style='background:#1976D2;color:white;text-align:center;padding:20px'>"
+                "<h1>Fumhood WiFi</h1>"
+                "<form method='POST' action='/save'>"
+                "<input type='text' name='ssid' placeholder='SSID' required><br><br>"
+                "<input type='password' name='pwd' placeholder='Password' required><br><br>"
+                "<button type='submit'>Connect</button>"
+                "</form></body></html>";
+  wifiServer.send(200, "text/html", html);
+}
+
+void handleWiFiSave() {
+  if (wifiServer.hasArg("ssid") && wifiServer.hasArg("pwd")) {
+    String ssid = wifiServer.arg("ssid");
+    String password = wifiServer.arg("pwd");
+    
+    String resp = "<html><body style='background:#1976D2;color:white;text-align:center;padding:50px'>"
+                  "<h1>Connecting...</h1><p>Device will restart.</p></body></html>";
+    wifiServer.send(200, "text/html", resp);
+    
+    // Save credentials to NVS
+    wifiPrefs.begin("wifi_cred", false);
+    wifiPrefs.putString("ssid", ssid);
+    wifiPrefs.putString("pass", password);
+    wifiPrefs.end();
+    
+    delay(500);
+    Serial.printf("[WiFi] Credentials saved: %s\n", ssid.c_str());
+    delay(2000);
+    ESP.restart();
+  } else {
+    wifiServer.send(400, "text/plain", "Error");
+  }
+}
+
+void startWiFiAPPortal() {
+  // วาดหน้า AP mode บน TFT
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("WiFi Provisioning", 10, 10);
+  tft.drawFastHLine(0, 35, 480, TFT_DARKGREY);
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.drawString("1. เชื่อมต่อ WiFi: Fumhood_Setup", 10, 50);
+  tft.drawString("2. รหัสผ่าน: 12345678", 10, 66);
+  tft.drawString("3. เปิดเบราเซอร์: http://192.168.4.1", 10, 82);
+  tft.drawString("4. กรอก SSID + รหัสผ่าน WiFi บ้าน แล้ว Connect", 10, 98);
+  tft.drawFastHLine(0, 115, 480, TFT_DARKGREY);
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  tft.drawString("AP กำลังทำงาน...", 10, 122);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.drawString("[ESC] ค้าง 2 วิ = ออก", 10, 138);
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(WIFI_SSID, WIFI_PASSWORD);
+  Serial.printf("[WiFi] AP started - SSID: %s\n", WIFI_SSID);
+
+  wifiServer.on("/", handleWiFiPortal);
+  wifiServer.on("/save", handleWiFiSave);
+  wifiServer.begin();
+
+  in_wifi_prov_mode = true;
+  wifi_prov_start_time = millis();
+  unsigned long prov_timeout = 300000; // 5 นาที
+  unsigned long esc_start = 0;
+
+  while (millis() - wifi_prov_start_time < prov_timeout && in_wifi_prov_mode) {
+    bt();
+    if (btn_esc == HIGH) {
+      if (esc_start == 0) esc_start = millis();
+      if (millis() - esc_start >= 2000) {
+        Serial.println("[WiFi] Exiting AP by ESC");
+        break;
+      }
+    } else {
+      esc_start = 0;
+    }
+    wifiServer.handleClient();
+    delay(10);
+  }
+
+  wifiServer.stop();
+  WiFi.mode(WIFI_OFF);
+  in_wifi_prov_mode = false;
+  Serial.println("[WiFi] AP mode ended");
+  delay(300);
+  ESP.restart();
+}
+
+void enterWiFiProvisioningMode() {
+  // แสดงหน้าตรวจสอบ status ก่อน (lvglPaused ถูกตั้งใน showWiFiProvisioningScreen)
+  showWiFiProvisioningScreen();
+
+  // ถ้า WiFi เชื่อมได้ → ออกได้เลย ไม่ต้องเปิด AP
+  // รอให้ user กด ENT ค้าง 3 วิ เพื่อเปิด AP portal
+  // หรือ ESC ค้าง 2 วิ เพื่อออก
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  tft.drawString("[ESC] ค้าง 2 วิ = ออก", 10, 228);
+
+  unsigned long wait_start = millis();
+  unsigned long ent_start = 0;
+  unsigned long esc_start2 = 0;
+
+  while (millis() - wait_start < 30000) { // รอ 30 วินาที
+    bt();
+
+    // ENT ค้าง 3 วิ → เปิด AP portal
+    if (btn_ent == HIGH) {
+      if (ent_start == 0) {
+        ent_start = millis();
+        // แสดง countdown บนหน้าจอ
+        tft.fillRect(0, 245, 480, 20, TFT_BLACK);
+        tft.setTextColor(TFT_CYAN, TFT_BLACK);
+        tft.drawString("กำลังเปิด AP...", 10, 248);
+      }
+      // แสดง progress bar
+      int elapsed = millis() - ent_start;
+      int barW = map(elapsed, 0, 3000, 0, 200);
+      tft.fillRect(10, 262, barW, 8, TFT_CYAN);
+      tft.drawRect(10, 262, 200, 8, TFT_DARKGREY);
+
+      if (elapsed >= 3000) {
+        Serial.println("[ENT] Starting AP portal");
+        // startWiFiAPPortal จะ restart — resume ไม่จำเป็น
+        startWiFiAPPortal();
+        lvglPaused = false;
+        return;
+      }
+    } else {
+      if (ent_start > 0) {
+        // ปล่อยปุ่มก่อนครบ → reset
+        ent_start = 0;
+        tft.fillRect(0, 245, 480, 30, TFT_BLACK);
+        tft.setTextSize(1);
+        tft.setTextColor(TFT_CYAN, TFT_BLACK);
+        tft.drawString("[ENT] ค้าง 3 วิ  ->  เริ่ม WiFi Provisioning", 10, 213);
+      }
+    }
+
+    // ESC ค้าง 2 วิ → ออก
+    if (btn_esc == HIGH) {
+      if (esc_start2 == 0) esc_start2 = millis();
+      if (millis() - esc_start2 >= 2000) {
+        Serial.println("[ESC] Exiting WiFi screen");
+        break;
+      }
+    } else {
+      esc_start2 = 0;
+    }
+
+    delay(10);
+  }
+
+  Serial.println("[WiFi] Status screen timeout, returning to normal");
+  // เปิด LVGL กลับมา
+  lvglPaused = false;
+  lv_obj_invalidate(lv_scr_act()); // เคลียร์แคชเพื่อ redraw หน้า LVGL
+}
+
 void checkResetButton() {
   static unsigned long esc_start_time = 0;
   static bool is_esc_pressing = false;
+  static bool prov_mode_triggered = false;
 
-  // ï¿½ï¿½Ç¨ï¿½Íºï¿½ï¿½Ò»ï¿½ï¿½ï¿½ï¿½Ù¡ï¿½ï¿½ (ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ btn_esc ï¿½ï¿½ï¿½Ê¶Ò¹Ð·ï¿½ï¿½ï¿½ï¿½Ò¹ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ digitalRead)
   if (btn_esc == HIGH) { 
-    
     if (!is_esc_pressing) {
       is_esc_pressing = true;
-      esc_start_time = millis(); 
+      esc_start_time = millis();
+      prov_mode_triggered = false;
     }
 
-    // ï¿½ï¿½ï¿½ä¢¨Ò¡ 3000 ï¿½ï¿½ï¿½ï¿½ 5000 (Ë¹ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ô¹Ò·ï¿½)
-    if (millis() - esc_start_time >= 5000) {
-      Serial2.println("System Restarting..."); // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Í¹ï¿½ï¿½Í¹ï¿½ï¿½Êµï¿½ï¿½ï¿½ï¿½
-      delay(100); // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ Serial ï¿½è§¢ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Í¡ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ãºï¿½ï¿½Í¹
-      ESP.restart();
-      
+    // Hold 3 seconds = WiFi Provisioning mode
+    if (!prov_mode_triggered && (millis() - esc_start_time >= 3000)) {
+      prov_mode_triggered = true;
+      Serial.println("[ESC] WiFi Provisioning Mode Triggered");
+      enterWiFiProvisioningMode();
     }
     
   } else {
-    // ï¿½ï¿½ï¿½ï¿½Í»ï¿½ï¿½ï¿½Â»ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ê¶Ò¹ï¿½
     is_esc_pressing = false;
+    prov_mode_triggered = false;
   }
 }
 
