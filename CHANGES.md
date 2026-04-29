@@ -1,6 +1,129 @@
 # บันทึกการแก้ไข Fumhood Project
 
-## รายการการแก้ไขทั้งหมด
+---
+
+## Session 2 — 2026-04-29 (commit d19cc37)
+
+### 🔧 Firmware Changes
+
+#### S2-1. ENT Long-Press: เปิดเท่านั้น → คืนค่าเป็น Toggle
+**ประวัติ:**
+- แก้ครั้งแรก: `checkLongPress()` สั่งเปิดเท่านั้น (`!isSystemOn` guard)
+- ผู้ใช้รายงาน: "กดปิดยังไม่ปิดเลย"
+- **ผลสุดท้าย:** คืนค่าเป็น toggle — กดค้าง 3 วินาทีสลับเปิด/ปิด (`isSystemOn = !isSystemOn`)
+
+**โค้ดปัจจุบัน (`checkLongPress()`):**
+```cpp
+if (!actionTriggered && (millis() - pressStartTime_btn >= 3000)) {
+    actionTriggered = true;
+    isSystemOn = !isSystemOn;
+    if (isSystemOn) wakeUpScreen();
+    else            shutDownScreen();
+}
+```
+
+---
+
+#### S2-2. Boot ไม่เปิดหน้าจออัตโนมัติ
+**ปัญหา:** เดิม `setup()` มี `isSystemOn = true; wakeUpScreen();` → บอร์ดเปิดหน้าจอทันทีทุกครั้งที่ reset ไม่สามารถกดปิดได้
+
+**แก้ไข:** เปลี่ยนเป็น:
+```cpp
+isSystemOn = false;
+shutDownScreen();
+```
+→ หลัง reset บอร์ดอยู่ในสถานะปิด ต้องกด ENT ค้าง 3 วินาทีเพื่อเปิด
+
+---
+
+#### S2-3. Fan Mode → HIGH อัตโนมัติเมื่อลมต่ำ (เงื่อนไข fanOn แทน mode_is_auto)
+**ปัญหา:** เดิมใช้ gate `mode_is_auto` → ถ้าอยู่ DIRECT mode แม้จะกดพัดลม m_fan ก็ไม่เปลี่ยนเป็น HIGH
+
+**แก้ไข (`readWind()`):** เปลี่ยน gate เป็น `fanOn_wind = lv_obj_has_state(objects.fan, LV_STATE_CHECKED)`:
+- เปิดพัดลม + ลมต่ำกว่า `alert_set` → ส่ง `FAN_HIGH` + label "HIGH" + add_state speed
+- เปิดพัดลม + ลมสูงกว่า threshold → ส่ง `FAN_LOW` + label "AUTO" + clear_state speed
+- ทำงานทั้งโหมด AUTO และ DIRECT ตราบใดที่พัดลมเปิดอยู่
+
+---
+
+#### S2-4. NVS จากแอพเร็วขึ้น — ลบ `publishNvsScheduleToFirebase` หลัง scheduleEdit
+**ปัญหา:** หลังบันทึก scheduleEdit จากแอพ บอร์ดโหลด NVS 7 วัน + สร้าง JSON ขนาดใหญ่ + PUT SSL กิน ~3–5 วินาที → UI ค้าง
+
+**แก้ไข:** ลบ `publishNvsScheduleToFirebase()` ออกจาก handler scheduleEdit (แอพรู้ค่าที่ตัวเองส่งอยู่แล้ว — ไม่จำเป็นต้อง republish กลับ)
+
+**ก่อน:**
+```cpp
+if (didScheduleEdit) {
+    DELETE scheduleEdit flag   // timeout 4s
+    publishNvsScheduleToFirebase();  // ~3-5s blocking
+}
+```
+
+**หลัง:**
+```cpp
+if (didScheduleEdit) {
+    DELETE scheduleEdit flag   // timeout 2s เท่านั้น
+}
+```
+
+---
+
+#### S2-5. HTTP Timeout ลดทุกตัว
+ลด worst-case stall จาก 4–8 วินาที → 1.5 วินาที:
+
+| ฟังก์ชัน | เดิม | ใหม่ |
+|--------|------|------|
+| `sendSensorData()` PUT | 4000ms | 1500ms |
+| `readFirebaseCommands()` GET | 4000ms | 1500ms |
+| `sendAlarmStatusImmediately()` PATCH | 4000ms | 1500ms |
+| clearAlarms PUT | 4000ms | 1500ms |
+| bt_2 exit PUT | 4000ms | 1500ms |
+| scheduleEdit DELETE | 4000ms | 2000ms |
+| `readAppSchedules()` GET | 4000ms | 2000ms |
+| `publishNvsScheduleToFirebase()` PUT | 8000ms | 3000ms |
+| `readFirebaseCommands()` polling interval | 2000ms→800ms | 1500ms |
+
+---
+
+#### S2-6. Performance — ลดงานหนักใน loop
+**ปัญหา:** บอร์ดกระตุกเป็นระยะ แม้ HTTP timeout สั้นลงแล้ว
+
+**แก้ไข 3 จุด:**
+
+**(a) `led_add_state()` throttle 50ms**
+- เดิม: ถูกเรียกทุก loop iteration (~1kHz) → `digitalRead` + `lv_obj_has_state` × 7 ทุก ms
+- ใหม่: เรียกทุก 50ms (~20Hz) ลดโหลด 95%
+
+**(b) `led_time` GPIO — cache state**
+```cpp
+static int8_t last_led_time = -1;
+bool s = lv_obj_has_state(objects.mode, LV_STATE_CHECKED);
+if ((int8_t)s != last_led_time) {
+    digitalWrite(led_time, s ? HIGH : LOW);
+    last_led_time = s;
+}
+```
+เดิมเรียก `digitalWrite` + `lv_obj_has_state` ทุก loop
+
+**(c) `pinMode(led1, OUTPUT)` ใน `readWind()` — เรียกครั้งเดียว**
+- เดิม: `pinMode(led1, OUTPUT)` ทุก 30ms ทุกครั้งที่พัดลมเปิด
+- ใหม่: เรียกครั้งเดียวด้วย static flag `led1_is_output`; cache `last_led1` เพื่อ `digitalWrite` เฉพาะตอนเปลี่ยนค่า
+
+---
+
+#### S2-7. App สั่ง Relay ผ่าน Nano ไม่ทำงาน
+**สาเหตุหลัก:** `CT_mode()` ใน APP mode block มี `return` ก่อนที่ `state_device()` จะถูกเรียก → LVGL state เปลี่ยนจากแอพแล้ว แต่ edge-detect ใน `sync_state()` ไม่ทำงาน → ไม่มี `FAN_ON/LIGHT_ON/PUMP_ON/SPRAY_ON/RESERVE_ON` ส่งออก Serial2 ไป Nano
+
+**แก้ไข:** เพิ่ม `state_device()` ก่อน `return` ใน APP mode block:
+```cpp
+// [APP_CTRL] sync LVGL state → Serial2 commands ไปที่ Nano (relay)
+state_device();
+return; // ล็อกปุ่มอื่นๆ ทั้งสิ้น
+```
+
+---
+
+## รายการการแก้ไขทั้งหมด (Session 1)
 
 ### 🔧 Bug Fixes (Firmware - `fumhood.ino`)
 
