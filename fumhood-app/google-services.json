@@ -1,0 +1,48 @@
+{
+  "project_info": {
+    "project_number": "557967544756",
+    "firebase_url": "https://fumhood-ac-default-rtdb.asia-southeast1.firebasedatabase.app",
+    "project_id": "fumhood-ac",
+    "storage_bucket": "fumhood-ac.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:557967544756:android:a9221cd04b1d617738a2e1",
+        "android_client_info": {
+          "package_name": "com.fumhood.automation"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "557967544756-mvbtqv3baksa6rv1a1qe5tnu60auftgj.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAzkJH7ZkbFNhecYadovise1WQ7ZcAtykg"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "557967544756-mvbtqv3baksa6rv1a1qe5tnu60auftgj.apps.googleusercontent.com",
+              "client_type": 3
+            },
+            {
+              "client_id": "557967544756-7io9lviv16336q5j1c7n2hj8sj4d6pc3.apps.googleusercontent.com",
+              "client_type": 2,
+              "ios_info": {
+                "bundle_id": "fumhoof-ac",
+                "app_store_id": "159753"
+              }
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

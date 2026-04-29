@@ -17,6 +17,7 @@
       "bundleIdentifier": "fumhood-ac"
     },
     "android": {
+      "googleServicesFile": "./google-services.json",
       "package": "com.fumhood.automation",
       "versionCode": 1,
       "adaptiveIcon": {
