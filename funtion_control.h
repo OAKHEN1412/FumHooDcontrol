@@ -4,7 +4,8 @@
 #include <RTClib.h>
 #include <lvgl.h>
 #include "LGFX_ILI9488_S3.hpp"
-LGFX tft;
+// [BUG 6] LGFX tft is now defined in fumhood.ino; only declare it here
+extern LGFX tft;
 // 1. อ้างอิงตัวแปรจากไฟล์หลัก และไฟล์ UI
 extern RTC_DS3231 rtc;          
 extern objects_t objects; 

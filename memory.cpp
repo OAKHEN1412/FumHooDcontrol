@@ -1,29 +1,12 @@
 #include <Arduino.h>
 #include <Preferences.h>
+#include "memory.h"  // [BUG 5] ใช้ struct ProgramData จาก header แทนการประกาศซ้ำ
 
 // ==========================================
-// ส่วนที่เพิ่มเข้ามาแทนไฟล์ Constants.h
+// ตัวแปร Global
 // ==========================================
 
-// โครงสร้างข้อมูลสำหรับเก็บค่าการตั้งเวลา
-struct ProgramData {
-    int hour_start[6];
-    int minute_start[6];
-    int hour_end[6];
-    int minute_end[6];
-    
-    // แยกเก็บสถานะของอุปกรณ์ 5 ชนิด (0=ปิด, 1=เปิด)
-    int fan[6];
-    int light[6];
-    int pump[6];
-    int spray[6];
-    int reserve[6]; // <--- [เพิ่ม] ตัวแปร reserve
-    
-    // สถานะเปิด/ปิดการทำงานของ Slot นั้นๆ
-    int state[6];
-};
-
-// สร้าง Object สำหรับการบันทึกข้อมูล
+// สร้าง Object สำหรับการบันทึกข้อมูล (declared extern in memory.h)
 Preferences prefs;
 
 // ==========================================

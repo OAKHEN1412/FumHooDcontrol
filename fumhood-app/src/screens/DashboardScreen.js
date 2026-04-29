@@ -94,6 +94,8 @@ export default function DashboardScreen({ route, navigation }) {
 
   const online       = status?.online === true && lastUpdated && (Date.now() - lastUpdated < 15000);
   const appCtrlOn    = !!status?.appControlMode;
+  const fanOn        = !!status?.fan;
+  const silenOn      = !!status?.silen;
 
   if (loading) {
     return (
@@ -140,6 +142,11 @@ export default function DashboardScreen({ route, navigation }) {
 
   const clearAlarms = () => {
     set(ref(db, `devices/${deviceId}/commands/clearAlarms`), true);
+  };
+
+  const toggleSilen = () => {
+    if (!appCtrlOn || !fanOn) return;
+    set(ref(db, `devices/${deviceId}/commands/silen`), !silenOn);
   };
 
   return (
@@ -212,6 +219,38 @@ export default function DashboardScreen({ route, navigation }) {
         <SensorCard icon="speedometer" label="m/s"    value={status?.windMs?.toFixed(2)} unit="m/s" />
         <SensorCard icon="speedometer" label="ft/min" value={status?.windFt?.toFixed(1)} unit="ft/min" />
       </View>
+
+      {/* Silen (Mute) toggle */}
+      <TouchableOpacity
+        style={[styles.silenRow, silenOn && styles.silenRowOn, (!appCtrlOn || !fanOn) && styles.disabled]}
+        onPress={toggleSilen}
+        activeOpacity={(appCtrlOn && fanOn) ? 0.7 : 1}
+      >
+        <Ionicons
+          name={silenOn ? 'volume-mute' : 'volume-high'}
+          size={26}
+          color={silenOn ? '#fff' : colors.primaryDark}
+        />
+        <View style={{ flex: 1, marginLeft: spacing.sm }}>
+          <Text style={[styles.silenLabel, silenOn && styles.silenLabelOn]}>
+            {silenOn ? 'ปิดเสียงเตือน (Mute)' : 'เปิดเสียงเตือน'}
+          </Text>
+          <Text style={[styles.silenHint, silenOn && styles.silenHintOn]}>
+            {!appCtrlOn
+              ? 'เปิด App Control เพื่อสั่งงาน'
+              : !fanOn
+              ? 'เปิดพัดลมก่อน จึงจะสั่งปิดเสียงได้'
+              : 'แตะเพื่อสลับเสียงเตือน'}
+          </Text>
+        </View>
+        <Switch
+          value={silenOn}
+          onValueChange={toggleSilen}
+          trackColor={{ true: '#CE93D8', false: '#999' }}
+          thumbColor={silenOn ? '#fff' : '#ddd'}
+          disabled={!appCtrlOn || !fanOn || !online}
+        />
+      </TouchableOpacity>
 
       <Text style={styles.section}>
         สถานะอุปกรณ์ {appCtrlOn ? '(ควบคุมจากแอพ)' : '(ดูอย่างเดียว)'}
@@ -293,6 +332,13 @@ const styles = StyleSheet.create({
   modeHint:         { fontSize: 11, color: colors.textMuted, marginTop: 2 },
   modeHintDirect:   { color: '#90CAF9' },
   disabled:         { opacity: 0.55 },
+
+  silenRow:         { flexDirection: 'row', alignItems: 'center', backgroundColor: colors.surface, padding: spacing.md, borderRadius: radius.md, marginTop: spacing.md, marginBottom: spacing.sm, borderWidth: 2, borderColor: colors.border },
+  silenRowOn:       { backgroundColor: '#6A1B9A', borderColor: '#4A148C' },
+  silenLabel:       { fontSize: 14, fontWeight: '700', color: colors.text },
+  silenLabelOn:     { color: '#fff' },
+  silenHint:        { fontSize: 11, color: colors.textMuted, marginTop: 2 },
+  silenHintOn:      { color: '#E1BEE7' },
 
   alarmBanner:      { flexDirection: 'row', alignItems: 'center', backgroundColor: '#D32F2F', padding: spacing.md, borderRadius: radius.md, marginBottom: spacing.md },
   alarmText:        { color: '#fff', fontWeight: '700', fontSize: 13 },

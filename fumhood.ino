@@ -32,7 +32,7 @@ void initDeviceId() {
 }
 
 unsigned long lastFirebaseSend = 0;
-const unsigned long FIREBASE_INTERVAL = 1500; // ส่งสถานะทุก 1.5 วิ (เดิม 5 วิ)
+const unsigned long FIREBASE_INTERVAL = 3000; // ส่งสถานะทุก 3 วิ (ลด HTTP load)
 // ขอให้ส่ง /status ครั้งถัดไปทันที (เรียกจาก state_device เมื่อมีอะไรเปลี่ยน)
 volatile bool firebaseForcePush = false;
 inline void requestFirebasePush() { firebaseForcePush = true; }
@@ -43,7 +43,8 @@ volatile bool lvglPaused = false;
 // NVS for storing WiFi credentials
 Preferences wifiPrefs;
 
-extern LGFX tft;
+// [BUG 6] Definition of LGFX tft (declared extern in funtion_control.h)
+LGFX tft;
 // ï¿½ï¿½Ë¹ï¿½ï¿½ï¿½Ò´Ë¹ï¿½Ò¨Íµï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ø³ï¿½ï¿½ï¿½ï¿½Ò¹ï¿½ï¿½Ô§
 #define SCREEN_WIDTH  480 
 #define SCREEN_HEIGHT 320
@@ -170,7 +171,7 @@ void onWiFiConnectedOnce() {
       HTTPClient hc;
       hc.begin(cl, cmdUrl);
       hc.addHeader("Content-Type", "application/json");
-      hc.setTimeout(4000);
+      hc.setTimeout(1500);
       hc.PUT("false");
       hc.end();
       Serial.println("[APP_CTRL] reset appControlMode=false on Firebase (board restart)");
@@ -205,7 +206,7 @@ void sendAlarmStatusImmediately() {
   HTTPClient http;
   http.begin(client, url);
   http.addHeader("Content-Type", "application/json");
-  http.setTimeout(4000);
+  http.setTimeout(1500);
   int code = http.PATCH(json);
   if (code > 0) {
     Serial.printf("[FB] Alarm status PATCH %d: alarm1=%d alarm2=%d alarm3=%d\n", 
@@ -241,6 +242,7 @@ void sendSensorData() {
   json += "\"pump\":"       + String(f_pump    ? "true" : "false") + ",";
   json += "\"spray\":"      + String(f_spray   ? "true" : "false") + ",";
   json += "\"reserve\":"    + String(f_reserve ? "true" : "false") + ",";
+  json += "\"silen\":"      + String(silen     ? "true" : "false") + ",";
   json += "\"directMode\":" + String(f_direct  ? "true" : "false") + ",";
   json += "\"appControlMode\":" + String(appControlMode ? "true" : "false") + ",";
   // ส่ง alarm states
@@ -256,7 +258,7 @@ void sendSensorData() {
   HTTPClient http;
   http.begin(client, url);
   http.addHeader("Content-Type", "application/json");
-  http.setTimeout(4000);
+  http.setTimeout(1500);
   int code = http.PUT(json);
   if (code > 0) {
     Serial.printf("[FB] PUT %d\n", code);
@@ -296,7 +298,7 @@ void publishNvsScheduleToFirebase() {
   HTTPClient http;
   http.begin(client, url);
   http.addHeader("Content-Type", "application/json");
-  http.setTimeout(8000);
+  http.setTimeout(3000);
   int code = http.PUT(json);
   Serial.printf("[FB] NVS schedule publish: %d\n", code);
   http.end();
@@ -312,13 +314,13 @@ void readFirebaseCommands() {
     WiFiClientSecure clExit; clExit.setInsecure();
     HTTPClient hcExit; hcExit.begin(clExit, exitUrl);
     hcExit.addHeader("Content-Type", "application/json");
-    hcExit.setTimeout(4000);
+    hcExit.setTimeout(1500);
     hcExit.PUT("false");
     hcExit.end();
     Serial.println("[APP_CTRL] wrote appControlMode=false to Firebase (bt_2 exit)");
   }
   static unsigned long lastRead = 0;
-  if (millis() - lastRead < 1000) return;  // 1s polling
+  if (millis() - lastRead < 1500) return;  // 1.5s polling (สมดุลระหว่าง responsive กับ SSL overhead)
   lastRead = millis();
 
   String url = String(FIREBASE_DB_BASE) + "/devices/" + deviceId + "/commands.json";
@@ -327,7 +329,7 @@ void readFirebaseCommands() {
   client.setInsecure();
   HTTPClient http;
   http.begin(client, url);
-  http.setTimeout(4000);
+  http.setTimeout(1500);
   int code = http.GET();
   String seBlock = "";        // เก็บไว้ส่งต่อหลัง http.end()
   bool didScheduleEdit = false;
@@ -422,6 +424,27 @@ void readFirebaseCommands() {
           applyIfChanged(objects.mode, v_directMode);
         }
       }
+
+      // ----- silen (Mute) command from app: only valid while fan is ON -----
+      int v_silen = getVal("silen");
+      if (v_silen >= 0) {
+        bool fanOn = (objects.fan != NULL) && lv_obj_has_state(objects.fan, LV_STATE_CHECKED);
+        bool desired_silen = (v_silen == 1);
+        if (fanOn && desired_silen != silen) {
+          silen      = desired_silen;
+          isMuteOpen = !silen;
+          warring    = isMuteOpen;
+          if (objects.sound_1 != NULL) {
+            // CHECKED = muted (silen=true) — ให้ตรงกับ handle_mute_button()
+            if (silen) lv_obj_add_state  (objects.sound_1, LV_STATE_CHECKED);
+            else       lv_obj_clear_state(objects.sound_1, LV_STATE_CHECKED);
+            lv_obj_invalidate(objects.sound_1);
+          }
+          Serial2.println(silen ? "Mute: CLOSE" : "Mute: OPEN");
+          requestFirebasePush();
+          Serial.printf("[APP_CTRL] silen=%s (from app)\n", silen ? "true" : "false");
+        }
+      }
     }
 
     // ----- (3) clearAlarms (allowed any mode) -----
@@ -471,6 +494,8 @@ void readFirebaseCommands() {
         Serial.printf("[NVS_EDIT] saved d=%d s=%d %02d:%02d-%02d:%02d state=%d\n",
                       d, s, p.hour_start[s], p.minute_start[s],
                       p.hour_end[s], p.minute_end[s], p.state[s]);
+        // invalidate cache ทันที เพื่อให้ checkAndRunSchedule() โหลด schedule ใหม่ในรอบถัดไป
+        recheckupdata();
         didScheduleEdit = true;
       }
     }
@@ -485,29 +510,24 @@ void readFirebaseCommands() {
     HTTPClient hc2;
     hc2.begin(cl2, clearUrl);
     hc2.addHeader("Content-Type", "application/json");
-    hc2.setTimeout(4000);
+    hc2.setTimeout(1500);
     hc2.PUT("false");
     hc2.end();
     Serial.println("[ALARM] clearAlarms PUT false done");
   }
 
-  // ----- DELETE one-shot scheduleEdit + republish NVS AFTER ปิด HTTP ตัวนอก -----
-  // ทำ sequential (ไม่ซ้อน): outer http.end() → DELETE → publish
-  // แต่ละตัวใช้ WiFiClientSecure ตัวเดียวไม่ overlap กัน → heap ปลอดภัย
+  // ----- DELETE one-shot scheduleEdit AFTER ปิด HTTP ตัวนอก -----
+  // ไม่ republish nvsSchedule กลับ เพราะแอปรู้ค่าที่ตัวเองส่งอยู่แล้ว
+  // (republish ใช้ ~3-5s SSL+heap → ทำให้บอร์ดค้างชั่วขณะ และ schedule ทำงานช้า)
   if (didScheduleEdit) {
-    // (1) DELETE flag
-    {
-      String delUrl = String(FIREBASE_DB_BASE) + "/devices/" + deviceId + "/commands/scheduleEdit.json";
-      WiFiClientSecure cl3;
-      cl3.setInsecure();
-      HTTPClient hc3;
-      hc3.begin(cl3, delUrl);
-      hc3.setTimeout(4000);
-      hc3.sendRequest("DELETE");
-      hc3.end();
-    }
-    // (2) Republish ตาราง NVS ทั้งหมดให้แอพเห็นค่าล่าสุดจากบอร์ด
-    publishNvsScheduleToFirebase();
+    String delUrl = String(FIREBASE_DB_BASE) + "/devices/" + deviceId + "/commands/scheduleEdit.json";
+    WiFiClientSecure cl3;
+    cl3.setInsecure();
+    HTTPClient hc3;
+    hc3.begin(cl3, delUrl);
+    hc3.setTimeout(2000);
+    hc3.sendRequest("DELETE");
+    hc3.end();
   }
 }
 
@@ -617,7 +637,7 @@ void readAppSchedules() {
   cl.setInsecure();
   HTTPClient h;
   h.begin(cl, url);
-  h.setTimeout(4000);
+  h.setTimeout(2000);
   int code = h.GET();
   if (code == 200) {
     String body = h.getString();
@@ -904,6 +924,8 @@ void readWind() {
     if (wasFanOff) {
         // เพิ่งเปิดพัดลม → คืน buzzer state ตามค่า isMuteOpen ปัจจุบัน
         Serial2.println(isMuteOpen ? "Mute: OPEN" : "Mute: CLOSE");
+        // คืนค่า led1 เป็น OUTPUT เพื่อให้กลับมาคุมแสง
+        pinMode(led1, OUTPUT);
     }
     wasFanOff = false;
 
@@ -943,26 +965,31 @@ void readWind() {
     smoothedWindMs = (smoothedWindMs * (1.0 - filterFactor)) + (windms * filterFactor);
     smoothedWindFt = (smoothedWindFt * (1.0 - filterFactor)) + (windFtPerMin * filterFactor);
 
-    // ----- Local LED (led1 / GPIO1): logic ใหม่ -----
+    // ----- Local LED (led1 / GPIO1): ติดตาม wind threshold เท่านั้น -----
     // - fan ปิด → INPUT (จัดการที่ gate ด้านบน)
-    // - mute (silen) → OUTPUT LOW เงียบ
     // - ลม < threshold → OUTPUT HIGH ติดค้าง (เตือนลมตก)
-    // - ลม >= threshold → OUTPUT LOW ติดค้าง (ลมแรงพอ)
-    pinMode(led1, OUTPUT);
-    if (silen) {
-        digitalWrite(led1, LOW);
-    } else if (smoothedWindMs < alert_set) {
-        digitalWrite(led1, HIGH);
-    } else {
-        digitalWrite(led1, LOW);
+    // - ลม >= threshold → OUTPUT LOW (ลมแรงพอ)
+    // (silen ไม่มีผลต่อ LED — ปิดแค่เสียง buzzer เท่านั้น)
+    // หมายเหตุ: ไม่เรียก pinMode ทุก 30ms — ตั้งครั้งเดียวตอนเปลี่ยนจาก INPUT → OUTPUT
+    static bool led1_is_output = false;
+    if (!led1_is_output) {
+        pinMode(led1, OUTPUT);
+        led1_is_output = true;
+    }
+    static int8_t last_led1 = -1;
+    int8_t want = (smoothedWindMs < alert_set) ? HIGH : LOW;
+    if (want != last_led1) {
+        digitalWrite(led1, want);
+        last_led1 = want;
     }
 
     // ----- WIND_LOW / WIND_HIGH → Nano (คุม LED pin 7 + Buzzer) -----
-    // ส่งบน transition ข้าม threshold ทุกโหมด (auto + direct) เพื่อให้ LED แจ้งเตือนลมตกอัปเดตเสมอ
-    bool mode_is_auto = (objects.mode != NULL) && !lv_obj_has_state(objects.mode, LV_STATE_CHECKED);
+    // ส่งบน transition ข้าม threshold ทุกโหมด เพื่อให้ LED แจ้งเตือนลมตกอัปเดตเสมอ
+    // เงื่อนไขปรับ FAN_HIGH/FAN_LOW: ทำงานเมื่อพัดลมเปิดอยู่ (กดปุ่มพัดลมแล้ว)
+    bool fanOn_wind = (objects.fan != NULL) && lv_obj_has_state(objects.fan, LV_STATE_CHECKED);
     if (is_wind_zero_state == false && smoothedWindMs < alert_set) {
         Serial2.println("WIND_LOW");                  // → Nano: state=true → LED blink (ถ้าไม่ mute)
-        if (mode_is_auto) {
+        if (fanOn_wind) {
             Serial2.println("FAN_HIGH");
             if (objects.speed)  lv_obj_add_state(objects.speed, LV_STATE_CHECKED);
             if (objects.m_fan) {
@@ -973,7 +1000,7 @@ void readWind() {
         is_wind_zero_state = true;
     } else if (is_wind_zero_state == true && smoothedWindMs >= alert_set) {
         Serial2.println("WIND_HIGH");                 // → Nano: state=false → LED off
-        if (mode_is_auto) {
+        if (fanOn_wind) {
             Serial2.println("FAN_LOW");
             if (objects.speed)  lv_obj_clear_state(objects.speed, LV_STATE_CHECKED);
             if (objects.m_fan) {
@@ -1048,9 +1075,9 @@ void handle_mute_button() {
                 Serial2.println("Mode: MS");
             }
             isLongPressHandled = true;
-            while(digitalRead(bt_10) == HIGH) {
-                delay(10); 
-            }
+            // [BUG 8] removed blocking `while(digitalRead(bt_10)==HIGH){delay(10);}`.
+            // isLongPressHandled prevents the LOW-edge handler below from re-firing,
+            // and lastBtnState=HIGH stays until release, so loop() keeps running.
         }
     }
     if (currentBtnState == LOW && lastBtnState == HIGH) {
@@ -1127,7 +1154,7 @@ void loadPgSwitchData() {
 void bt() {
   static unsigned long lastPress = 0;
 
-  if (millis() - lastPress > 200) {
+  if (millis() - lastPress > 50) {   // ลด debounce 200→50ms เพิ่ม response
     lastPress = millis();
     btn_home  = digitalRead(bt_1);
     btn_time  = digitalRead(bt_2);
@@ -1163,12 +1190,7 @@ void bt() {
 }
 
 void sync_state(lv_obj_t *src, lv_state_t state) {
-    if(lv_obj_has_state(src, state)){
-        lv_obj_add_state(src, state);
-    }
-    else{
-        lv_obj_clear_state(src, state);
-    }
+    // [BUG 4] removed dead code (had been redundantly setting state to itself)
 
     static bool prev_fan = false;
     static bool prev_light = false;
@@ -1254,26 +1276,29 @@ void sync_state(lv_obj_t *src, lv_state_t state) {
 
 }
 void simple_toggle(lv_obj_t *obj,lv_obj_t *pnl, int pin) {
-   
-    if (digitalRead(pin) == HIGH) {
+    // [BUG 8] non-blocking edge-detect with per-pin debounce (no `while` blocking loop)
+    static int prev_states[48] = {0};
+    static uint32_t last_toggle_ms[48] = {0};
+    if (pin < 0 || pin >= 48) return;
 
+    int prev = prev_states[pin];
+    int cur  = digitalRead(pin);
+    uint32_t now = millis();
+
+    // Trigger only on LOW->HIGH edge AND when 250ms have passed since last toggle (debounce)
+    if (cur == HIGH && prev == LOW && (now - last_toggle_ms[pin] >= 250)) {
+        last_toggle_ms[pin] = now;
         if (lv_obj_has_state(obj, LV_STATE_CHECKED)) {
-            lv_obj_clear_state(obj, LV_STATE_CHECKED); 
-             lv_obj_clear_state(pnl, LV_STATE_CHECKED); 
+            lv_obj_clear_state(obj, LV_STATE_CHECKED);
+            lv_obj_clear_state(pnl, LV_STATE_CHECKED);
             if(obj == objects.speed){ lv_label_set_text(objects.m_fan, "LOW"); Serial2.println("FAN_LOW");}
         } else {
             lv_obj_add_state(obj, LV_STATE_CHECKED);
             lv_obj_add_state(pnl, LV_STATE_CHECKED);
             if(obj == objects.speed){ lv_label_set_text(objects.m_fan, "HIGH"); Serial2.println("FAN_HIGH");}
         }
-        while (digitalRead(pin) == HIGH) {
-            lv_timer_handler(); 
-            delay(10);          
-        }
-
-        delay(300); 
     }
-    
+    prev_states[pin] = cur;
 }
 static unsigned long pressStart = 0;
 static bool switched = false;
@@ -2285,7 +2310,7 @@ bool wait_page_btn = false;
 bool wait_direac_btn = false;
 #define CUR_SCREEN lv_scr_act()
 void CT_mode() {
-    if (!lvglPaused) lv_timer_handler(); // run LVGL background
+    // lv_timer_handler() runs in main loop already (every 5ms) — no duplicate call here
 
     unsigned long now = millis();
     lv_obj_t* activeScreen = lv_scr_act(); // ดึงหน้าจอปัจจุบัน
@@ -2338,6 +2363,10 @@ void CT_mode() {
                 lv_label_set_text(objects.mode_label, "APP");
             }
         }
+        // [APP_CTRL] sync LVGL state → Serial2 commands ไปที่ Nano (relay)
+        // จำเป็น: ใน APP mode ปุ่มบนบอร์ดถูกล็อก แต่แอพเปลี่ยน LVGL state ผ่าน applyIfChanged
+        // ต้องเรียก state_device() เพื่อให้ edge-detect ใน sync_state ส่ง FAN_ON/LIGHT_ON/... ไป Nano
+        state_device();
         return; // ล็อกปุ่มอื่นๆ ทั้งสิ้น
     }
 
@@ -2545,6 +2574,11 @@ void Closing_on() {
 }
 
 void led_add_state(){
+    // Throttle: ไม่จำเป็นต้องรันทุก ms (LED ตามสถานะปุ่ม — 50ms พอ)
+    static uint32_t lastRunMs = 0;
+    if (millis() - lastRunMs < 50) return;
+    lastRunMs = millis();
+
     bool target_fan_state = lv_obj_has_state(objects.fan, LV_STATE_CHECKED);
     static bool stable_fan_state = false;   
     static bool is_fan_blinking = false; 
@@ -2814,6 +2848,7 @@ void setup()
     pinMode(led1,INPUT);
     Serial.begin(115200);
     Serial2.begin(19200, SERIAL_8N1, RX_PIN, TX_PIN);
+    Serial2.setTimeout(50);   // กัน readStringUntil() หยุดรอ 1วิ (default) ถ้า Nano ไม่ส่ง
     Serial2.println("restart"); 
     Serial.setTimeout(10);
     Serial.printf("RESET REASON: %d\n", esp_reset_reason());
@@ -2855,8 +2890,14 @@ void setup()
     lv_obj_clear_state(objects.panel_spray, LV_STATE_CHECKED);
     lv_obj_clear_state(objects.panel_reserve, LV_STATE_CHECKED);
     lv_obj_clear_state(objects.speed, LV_STATE_CHECKED);
+    // ---- เริ่มต้นโหมด: directMode=false, appControlMode=false → label = "AUTO" ----
+    if (objects.mode != NULL)       lv_obj_clear_state(objects.mode, LV_STATE_CHECKED);
+    if (objects.mode_label != NULL) lv_label_set_text(objects.mode_label, "AUTO");
     state_device();
     Serial2.println("restart");
+    // ---- ไม่ auto-start: ต้องกด ENT ค้าง 3 วิ ถึงเปิดเครื่อง ----
+    isSystemOn = false;
+    shutDownScreen();
 // delay(2000); // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ Serial Monitor ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ó§Ò¹
 
 //     // 1. ï¿½ï¿½ï¿½Ò§ï¿½ï¿½ï¿½ï¿½ï¿½Å¨ï¿½ï¿½Í§ (ï¿½ï¿½ï¿½ index 0 ï¿½Ö§ 5 ï¿½ï¿½ï¿½Ò¹ï¿½ï¿½ï¿½!)
@@ -2944,7 +2985,15 @@ void loop(){
     led_add_state();
     handle_mute_button();
     handleShortPressTask();
-    digitalWrite(led_time, (lv_obj_has_state(objects.mode, LV_STATE_CHECKED)) ? HIGH : LOW);
+    // led_time: cache state และเขียนเฉพาะตอนเปลี่ยน (ลดการเรียก GPIO+LVGL ทุก loop iteration)
+    {
+        static int8_t last_led_time = -1;
+        bool s = lv_obj_has_state(objects.mode, LV_STATE_CHECKED);
+        if ((int8_t)s != last_led_time) {
+            digitalWrite(led_time, s ? HIGH : LOW);
+            last_led_time = s;
+        }
+    }
     if (activationStartTime == 0) activationStartTime = millis();
     if (millis() - activationStartTime < numplecs) {
         if (CUR_SCREEN == objects.main) {
@@ -2970,7 +3019,6 @@ void loop(){
             readAppSchedules();
             runAppSchedules();
             if (millis() - mainScreenEnterTime > 3000 && hasReadWind) {
-                recheckupdata();
                 checkAndRunSchedule();                
                 // ï¿½Ò¡ï¿½ï¿½Í§ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Í¡ï¿½ï¿½ï¿½ï¿½Ò¹ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Íºï¿½Ñ´ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½Ã¶ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ flag ï¿½Ã§ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
                 // hasReadWind = false; 
@@ -3053,14 +3101,13 @@ void checkLongPress() {
             pressStartTime_btn = millis();
         }
 
-        if (!actionTriggered && (millis() - pressStartTime_btn >= 3000)) { // Å´ï¿½ï¿½ï¿½ï¿½ï¿½ 3 ï¿½ï¿½
-            isSystemOn = !isSystemOn;
+        if (!actionTriggered && (millis() - pressStartTime_btn >= 3000)) {
             actionTriggered = true;
-
+            isSystemOn = !isSystemOn;
             if (isSystemOn) {
                 wakeUpScreen();
             } else {
-               shutDownScreen();
+                shutDownScreen();
             }
         }
     } else {
@@ -3099,9 +3146,11 @@ void wakeUpScreen() {
     tft.setTextDatum(middle_center);
     tft.drawString(loadingText, barX + (barWidth / 2), barY + (barHeight / 2));
     tft.clearClipRect();
-    delay(100);
-    lv_obj_set_style_text_font(objects.m_fan, &ui_font_thai_18, 0);
-    lv_label_set_text(objects.m_fan, "Wait");
+    delay(20);   // [HANG-FIX] reduced from 100ms×100 (10s) to 20ms×100 (2s)
+    if (objects.m_fan != NULL) {
+        lv_obj_set_style_text_font(objects.m_fan, &ui_font_thai_18, 0);
+        lv_label_set_text(objects.m_fan, "Wait");
+    }
     is_wind_zero_state = false; 
   }
     tft.setTextDatum(top_left);
