@@ -32,7 +32,10 @@ void initDeviceId() {
 }
 
 unsigned long lastFirebaseSend = 0;
-const unsigned long FIREBASE_INTERVAL = 5000; // send every 5 sec
+const unsigned long FIREBASE_INTERVAL = 1500; // ส่งสถานะทุก 1.5 วิ (เดิม 5 วิ)
+// ขอให้ส่ง /status ครั้งถัดไปทันที (เรียกจาก state_device เมื่อมีอะไรเปลี่ยน)
+volatile bool firebaseForcePush = false;
+inline void requestFirebasePush() { firebaseForcePush = true; }
 
 // ป้องกัน LVGL render ทับหน้าจอ WiFi status
 volatile bool lvglPaused = false;
@@ -119,10 +122,20 @@ unsigned long wifi_prov_start_time = 0;
 
 // publishNvsScheduleToFirebase defined later (used in connectToWiFi)
 void publishNvsScheduleToFirebase();
+void readAppSchedules();
+void runAppSchedules();
 // update_alarm_overlay defined later (used in readFirebaseCommands)
+// appControlMode / requestExitAppMode defined later
+extern bool appControlMode;
+extern bool requestExitAppMode;
+extern bool silen;
+extern bool isMuteOpen;
+extern bool warring;
 void update_alarm_overlay();
 
-// ============ WiFi Connect from saved credentials ============
+// ============ WiFi Connect from saved credentials (NON-BLOCKING) ============
+// คืนค่า true ถ้ามี credentials และเรียก WiFi.begin() แล้ว (ยังไม่จำเป็นต้อง connected)
+// อุปกรณ์จะทำงานต่อได้ทันทีโดยไม่รอ WiFi
 bool connectToWiFi() {
   wifiPrefs.begin("wifi_cred", true);
   String ssid = wifiPrefs.getString("ssid", "");
@@ -130,26 +143,43 @@ bool connectToWiFi() {
   wifiPrefs.end();
   
   if (ssid.length() == 0) {
-    Serial.println("[WiFi] No saved credentials");
+    Serial.println("[WiFi] No saved credentials - running offline");
     return false;
   }
   
-  Serial.printf("[WiFi] Connecting to: %s\n", ssid.c_str());
+  Serial.printf("[WiFi] Async connecting to: %s\n", ssid.c_str());
   WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
   WiFi.begin(ssid.c_str(), pass.c_str());
-  
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
-    delay(500);
-  }
-  
-  if (WiFi.status() == WL_CONNECTED) {
+  // ไม่รอ — ปล่อยให้ ESP32 พยายามเชื่อมต่อพื้นหลัง
+  return true;
+}
+
+// เรียกครั้งเดียวเมื่อ WiFi เพิ่งเชื่อมต่อสำเร็จ → publish NVS schedule
+void onWiFiConnectedOnce() {
+  static bool publishedOnce = false;
+  if (!publishedOnce && WiFi.status() == WL_CONNECTED) {
     Serial.printf("[WiFi] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
-    publishNvsScheduleToFirebase(); // sync NVS schedule to Firebase on connect
-    return true;
+
+    // ---- รีเซ็ต appControlMode = false ที่ Firebase ทุกครั้งที่เปิดเครื่อง/รีเซ็ท ----
+    // เพื่อให้แอพรู้ว่าบอร์ด restart แล้ว (ป้องกัน flag ค้างจากเซสชั่นก่อน)
+    {
+      String cmdUrl = String(FIREBASE_DB_BASE) + "/devices/" + deviceId + "/commands/appControlMode.json";
+      WiFiClientSecure cl;
+      cl.setInsecure();
+      HTTPClient hc;
+      hc.begin(cl, cmdUrl);
+      hc.addHeader("Content-Type", "application/json");
+      hc.setTimeout(4000);
+      hc.PUT("false");
+      hc.end();
+      Serial.println("[APP_CTRL] reset appControlMode=false on Firebase (board restart)");
+    }
+    appControlMode = false;  // ตั้งค่า local ให้ตรงกัน
+
+    publishNvsScheduleToFirebase();
+    publishedOnce = true;
   }
-  Serial.println("[WiFi] Connection failed");
-  return false;
 }
 
 // Forward declare wind globals (defined later in this file)
@@ -189,7 +219,8 @@ void sendAlarmStatusImmediately() {
 // ============ Firebase REST - Send sensor data ============
 void sendSensorData() {
   if (WiFi.status() != WL_CONNECTED) return;
-  if (millis() - lastFirebaseSend < FIREBASE_INTERVAL) return;
+  if (!firebaseForcePush && (millis() - lastFirebaseSend < FIREBASE_INTERVAL)) return;
+  firebaseForcePush = false;
   lastFirebaseSend = millis();
 
   String url = String(FIREBASE_DB_BASE) + "/devices/" + deviceId + "/status.json";
@@ -198,17 +229,20 @@ void sendSensorData() {
   bool f_light    = lv_obj_has_state(objects.light, LV_STATE_CHECKED);
   bool f_pump     = lv_obj_has_state(objects.pump,  LV_STATE_CHECKED);
   bool f_spray    = lv_obj_has_state(objects.spray, LV_STATE_CHECKED);
+  bool f_reserve  = (objects.reserve != NULL) && lv_obj_has_state(objects.reserve, LV_STATE_CHECKED);
   bool f_direct   = (objects.mode != NULL) && lv_obj_has_state(objects.mode, LV_STATE_CHECKED);
 
   String json = "{";
   json += "\"windMs\":" + String(smoothedWindMs, 2) + ",";
   json += "\"windFt\":" + String(smoothedWindFt, 1) + ",";
   json += "\"online\":true,";
-  json += "\"fan\":"        + String(f_fan    ? "true" : "false") + ",";
-  json += "\"light\":"      + String(f_light  ? "true" : "false") + ",";
-  json += "\"pump\":"       + String(f_pump   ? "true" : "false") + ",";
-  json += "\"spray\":"      + String(f_spray  ? "true" : "false") + ",";
-  json += "\"directMode\":" + String(f_direct ? "true" : "false") + ",";
+  json += "\"fan\":"        + String(f_fan     ? "true" : "false") + ",";
+  json += "\"light\":"      + String(f_light   ? "true" : "false") + ",";
+  json += "\"pump\":"       + String(f_pump    ? "true" : "false") + ",";
+  json += "\"spray\":"      + String(f_spray   ? "true" : "false") + ",";
+  json += "\"reserve\":"    + String(f_reserve ? "true" : "false") + ",";
+  json += "\"directMode\":" + String(f_direct  ? "true" : "false") + ",";
+  json += "\"appControlMode\":" + String(appControlMode ? "true" : "false") + ",";
   // ส่ง alarm states
   json += "\"alarm1\":" + String(alarm_active[0] ? "true" : "false") + ",";
   json += "\"alarm2\":" + String(alarm_active[1] ? "true" : "false") + ",";
@@ -271,8 +305,20 @@ void publishNvsScheduleToFirebase() {
 // ============ Firebase REST - Read commands ============
 void readFirebaseCommands() {
   if (WiFi.status() != WL_CONNECTED) return;
+  // ---- bt_2 forced exit from APP mode: write false to Firebase immediately ----
+  if (requestExitAppMode) {
+    requestExitAppMode = false;
+    String exitUrl = String(FIREBASE_DB_BASE) + "/devices/" + deviceId + "/commands/appControlMode.json";
+    WiFiClientSecure clExit; clExit.setInsecure();
+    HTTPClient hcExit; hcExit.begin(clExit, exitUrl);
+    hcExit.addHeader("Content-Type", "application/json");
+    hcExit.setTimeout(4000);
+    hcExit.PUT("false");
+    hcExit.end();
+    Serial.println("[APP_CTRL] wrote appControlMode=false to Firebase (bt_2 exit)");
+  }
   static unsigned long lastRead = 0;
-  if (millis() - lastRead < 1000) return;  // ← ปรับจาก 3000 เป็น 1000 ms เพื่อ sync realtime
+  if (millis() - lastRead < 1000) return;  // 1s polling
   lastRead = millis();
 
   String url = String(FIREBASE_DB_BASE) + "/devices/" + deviceId + "/commands.json";
@@ -283,8 +329,34 @@ void readFirebaseCommands() {
   http.begin(client, url);
   http.setTimeout(4000);
   int code = http.GET();
+  String seBlock = "";        // เก็บไว้ส่งต่อหลัง http.end()
+  bool didScheduleEdit = false;
+  bool didClearAlarms   = false;
   if (code == 200) {
     String payload = http.getString();
+
+    // ----- (0) Pre-process scheduleEdit: extract + strip from payload -----
+    // (มิฉะนั้น getVal("fan"/"light"/"pump"/"spray") จะไปอ่านค่าใน scheduleEdit
+    //  แทนค่าระดับบนสุด ทำให้รีเลย์ติด/ดับผิดชั่วครู่หลังกดบันทึก)
+    int seKeyIdx = payload.indexOf("\"scheduleEdit\"");
+    if (seKeyIdx >= 0) {
+      int braceStart = payload.indexOf('{', seKeyIdx);
+      if (braceStart >= 0) {
+        int depth = 0, end = braceStart;
+        for (; end < (int)payload.length(); end++) {
+          if (payload[end] == '{') depth++;
+          else if (payload[end] == '}') { depth--; if (depth == 0) { end++; break; } }
+        }
+        seBlock = payload.substring(braceStart, end);
+        // ตัดทั้งคีย์และค่าออก รวมถึง comma นำหน้า/ตามหลัง
+        int cutFrom = seKeyIdx;
+        int cutTo   = end;
+        if (cutFrom > 0 && payload[cutFrom - 1] == ',') cutFrom--;
+        else if (cutTo < (int)payload.length() && payload[cutTo] == ',') cutTo++;
+        payload = payload.substring(0, cutFrom) + payload.substring(cutTo);
+      }
+    }
+
     // Simple manual JSON parse for bool values
     auto getVal = [&](const char* key) -> int {
       String search = String("\"") + key + "\":";
@@ -296,12 +368,25 @@ void readFirebaseCommands() {
       if (payload.substring(idx, idx + 5) == "false") return 0;
       return -1;
     };
-    int v_fan        = getVal("fan");
-    int v_light      = getVal("light");
-    int v_pump       = getVal("pump");
-    int v_spray      = getVal("spray");
-    int v_directMode = getVal("directMode"); // 1=direct, 0=auto
-    // เปลี่ยน LVGL state เฟพาะนำค่าใหม่ต่างจากเดิม = ป้องกัน relay ฟลิกเกอร์โดยไม่จำเป็น
+
+    // ----- (1) appControlMode flag (toggled only by app) -----
+    int v_appCtrl = getVal("appControlMode");
+    if (v_appCtrl >= 0) {
+      bool desired = (v_appCtrl == 1);
+      if (desired != appControlMode) {
+        appControlMode = desired;
+        Serial.printf("[APP_CTRL] mode -> %s\n", appControlMode ? "ON" : "OFF");
+        if (objects.mode_label != NULL) {
+          if (appControlMode) lv_label_set_text(objects.mode_label, "APP");
+          else {
+            bool d = (objects.mode != NULL) && lv_obj_has_state(objects.mode, LV_STATE_CHECKED);
+            lv_label_set_text(objects.mode_label, d ? "DIRECT" : "AUTO");
+          }
+        }
+        requestFirebasePush();
+      }
+    }
+
     auto applyIfChanged = [](lv_obj_t* obj, int newVal) {
       if (newVal < 0 || obj == NULL) return;
       bool cur = lv_obj_has_state(obj, LV_STATE_CHECKED);
@@ -311,48 +396,261 @@ void readFirebaseCommands() {
         else         lv_obj_clear_state(obj, LV_STATE_CHECKED);
       }
     };
-    applyIfChanged(objects.fan,   v_fan);
-    applyIfChanged(objects.light, v_light);
-    applyIfChanged(objects.pump,  v_pump);
-    applyIfChanged(objects.spray, v_spray);
-    // อัปเดต panel backgrounds ด้วย (ต้องเปลี่ยนสีพื้นหลังด้วยเมื่อปิด)
-    applyIfChanged(objects.panel_fan,   v_fan);
-    applyIfChanged(objects.panel_light, v_light);
-    applyIfChanged(objects.panel_pump,  v_pump);
-    applyIfChanged(objects.panel_spray, v_spray);
-    // directMode: ถ้าแอพสั่ง direct → set objects.mode (ปิด auto-schedule)
-    if (v_directMode >= 0 && objects.mode != NULL) {
-      bool cur_mode = lv_obj_has_state(objects.mode, LV_STATE_CHECKED);
-      bool new_mode = (v_directMode == 1);
-      if (cur_mode != new_mode) {
-        Serial.printf("[MODE] App sends directMode=%d, updating checkbox\n", v_directMode);
-        applyIfChanged(objects.mode, v_directMode);
-        if(objects.mode_label != NULL)
-          lv_label_set_text(objects.mode_label, v_directMode == 1 ? "DIRECT" : "AUTO");
+
+    // ----- (2) Device control (only when appControlMode is ON) -----
+    if (appControlMode) {
+      int v_fan        = getVal("fan");
+      int v_light      = getVal("light");
+      int v_pump       = getVal("pump");
+      int v_spray      = getVal("spray");
+      int v_reserve    = getVal("reserve");
+      int v_directMode = getVal("directMode");
+      applyIfChanged(objects.fan,         v_fan);
+      applyIfChanged(objects.light,       v_light);
+      applyIfChanged(objects.pump,        v_pump);
+      applyIfChanged(objects.spray,       v_spray);
+      applyIfChanged(objects.reserve,     v_reserve);
+      applyIfChanged(objects.panel_fan,   v_fan);
+      applyIfChanged(objects.panel_light, v_light);
+      applyIfChanged(objects.panel_pump,  v_pump);
+      applyIfChanged(objects.panel_spray, v_spray);
+      if (objects.panel_reserve) applyIfChanged(objects.panel_reserve, v_reserve);
+      if (v_directMode >= 0 && objects.mode != NULL) {
+        bool cur_mode = lv_obj_has_state(objects.mode, LV_STATE_CHECKED);
+        bool new_mode = (v_directMode == 1);
+        if (cur_mode != new_mode) {
+          applyIfChanged(objects.mode, v_directMode);
+        }
       }
     }
-    // clearAlarms: แอพสั่งล้าง alarm ค้าง → reset alarm_active[]
+
+    // ----- (3) clearAlarms (allowed any mode) -----
     int v_clearAlarms = getVal("clearAlarms");
     if (v_clearAlarms == 1) {
       Serial.println("[ALARM] clearAlarms command received, resetting all alarms");
       for (int i = 0; i < 3; i++) {
-        if (alarm_active[i]) {
-          alarm_active[i] = false;
-        }
+        if (alarm_active[i]) alarm_active[i] = false;
       }
       update_alarm_overlay();
-      // เคลียร์ flag clearAlarms ใน Firebase กลับเป็น false
-      String clearUrl = String(FIREBASE_DB_BASE) + "/devices/" + deviceId + "/commands/clearAlarms.json";
-      WiFiClientSecure cl2;
-      cl2.setInsecure();
-      HTTPClient hc2;
-      hc2.begin(cl2, clearUrl);
-      hc2.addHeader("Content-Type", "application/json");
-      hc2.PUT("false");
-      hc2.end();
+      didClearAlarms = true;  // PUT false หลัง http.end() เพื่อหลีกเลี่ยง 2 SSL clients พร้อมกัน
+    }
+
+    // ----- (4) scheduleEdit (NVS): app writes one slot to /commands/scheduleEdit -----
+    // payload: "scheduleEdit":{"d":0,"s":2,"hs":8,"ms":0,"he":9,"me":30,
+    //   "fan":1,"light":0,"pump":1,"spray":0,"reserve":0,"state":1}
+    if (seBlock.length() > 0) {
+      auto getInt = [&](const char* key, int defv) -> int {
+        String search = String("\"") + key + "\":";
+        int idx = seBlock.indexOf(search);
+        if (idx < 0) return defv;
+        idx += search.length();
+        while (idx < (int)seBlock.length() && seBlock[idx] == ' ') idx++;
+        // accept true/false as 1/0 ด้วย เผื่อ payload ส่งมาแบบ bool
+        if (seBlock.substring(idx, idx + 4) == "true")  return 1;
+        if (seBlock.substring(idx, idx + 5) == "false") return 0;
+        int end = idx;
+        while (end < (int)seBlock.length() && (isdigit(seBlock[end]) || seBlock[end]=='-')) end++;
+        if (end == idx) return defv;
+        return seBlock.substring(idx, end).toInt();
+      };
+      int d = getInt("d", -1);
+      int s = getInt("s", -1);
+      if (d >= 0 && d < 7 && s >= 0 && s < 6) {
+        ProgramData p = loadProgram(d);
+        p.hour_start[s]   = getInt("hs", p.hour_start[s]);
+        p.minute_start[s] = getInt("ms", p.minute_start[s]);
+        p.hour_end[s]     = getInt("he", p.hour_end[s]);
+        p.minute_end[s]   = getInt("me", p.minute_end[s]);
+        p.fan[s]     = getInt("fan",     p.fan[s]);
+        p.light[s]   = getInt("light",   p.light[s]);
+        p.pump[s]    = getInt("pump",    p.pump[s]);
+        p.spray[s]   = getInt("spray",   p.spray[s]);
+        p.reserve[s] = getInt("reserve", p.reserve[s]);
+        p.state[s]   = getInt("state",   p.state[s]);
+        saveSingleSlot(d, s, p);
+        Serial.printf("[NVS_EDIT] saved d=%d s=%d %02d:%02d-%02d:%02d state=%d\n",
+                      d, s, p.hour_start[s], p.minute_start[s],
+                      p.hour_end[s], p.minute_end[s], p.state[s]);
+        didScheduleEdit = true;
+      }
     }
   }
   http.end();
+
+  // ----- PUT false to clearAlarms AFTER outer http.end() → heap ปลอดภัย -----
+  if (didClearAlarms) {
+    String clearUrl = String(FIREBASE_DB_BASE) + "/devices/" + deviceId + "/commands/clearAlarms.json";
+    WiFiClientSecure cl2;
+    cl2.setInsecure();
+    HTTPClient hc2;
+    hc2.begin(cl2, clearUrl);
+    hc2.addHeader("Content-Type", "application/json");
+    hc2.setTimeout(4000);
+    hc2.PUT("false");
+    hc2.end();
+    Serial.println("[ALARM] clearAlarms PUT false done");
+  }
+
+  // ----- DELETE one-shot scheduleEdit + republish NVS AFTER ปิด HTTP ตัวนอก -----
+  // ทำ sequential (ไม่ซ้อน): outer http.end() → DELETE → publish
+  // แต่ละตัวใช้ WiFiClientSecure ตัวเดียวไม่ overlap กัน → heap ปลอดภัย
+  if (didScheduleEdit) {
+    // (1) DELETE flag
+    {
+      String delUrl = String(FIREBASE_DB_BASE) + "/devices/" + deviceId + "/commands/scheduleEdit.json";
+      WiFiClientSecure cl3;
+      cl3.setInsecure();
+      HTTPClient hc3;
+      hc3.begin(cl3, delUrl);
+      hc3.setTimeout(4000);
+      hc3.sendRequest("DELETE");
+      hc3.end();
+    }
+    // (2) Republish ตาราง NVS ทั้งหมดให้แอพเห็นค่าล่าสุดจากบอร์ด
+    publishNvsScheduleToFirebase();
+  }
+}
+
+// ============ App Schedules (รัน schedule จากแอพ ฝั่งบอร์ด) ============
+// app เขียนไว้ที่ /devices/{id}/appSchedules เป็น object รูปแบบ:
+//   { "0": {"t":"fan","sh":14,"sm":0,"eh":14,"em":1,"d":"01234","e":1}, ... }
+// บอร์ดจะอ่านทุก 30 วินาที (เฉพาะตอน appControlMode = ON) แล้วยิง relay เมื่อถึงเวลา
+struct AppSched {
+  char target[8];
+  uint8_t sH, sM, eH, eM;
+  uint8_t daysMask;   // bit 0 = Sun, bit 6 = Sat
+  bool    enabled;
+};
+static AppSched g_appSched[20];
+static int      g_appSchedCount = 0;
+
+static void setRelayState(const String& target, bool on) {
+  lv_obj_t* a = NULL;
+  lv_obj_t* b = NULL;
+  if      (target == "fan")   { a = objects.fan;   b = objects.panel_fan;   }
+  else if (target == "light") { a = objects.light; b = objects.panel_light; }
+  else if (target == "pump")  { a = objects.pump;  b = objects.panel_pump;  }
+  else if (target == "spray") { a = objects.spray; b = objects.panel_spray; }
+  else return;
+  lv_obj_t* arr[2] = { a, b };
+  for (int i = 0; i < 2; i++) {
+    lv_obj_t* o = arr[i];
+    if (!o) continue;
+    bool cur = lv_obj_has_state(o, LV_STATE_CHECKED);
+    if (cur == on) continue;
+    if (on) lv_obj_add_state(o, LV_STATE_CHECKED);
+    else    lv_obj_clear_state(o, LV_STATE_CHECKED);
+  }
+}
+
+static void parseAppSchedules(const String& payload) {
+  g_appSchedCount = 0;
+  if (payload.length() < 5) return;
+  int searchPos = 0;
+  while (g_appSchedCount < 20) {
+    int objStart = payload.indexOf('{', searchPos + 1);
+    if (objStart < 0) break;
+    int depth = 1;
+    int p = objStart + 1;
+    while (p < (int)payload.length() && depth > 0) {
+      char c = payload[p];
+      if (c == '{') depth++;
+      else if (c == '}') depth--;
+      p++;
+    }
+    if (depth != 0) break;
+    int objEnd = p - 1;
+    String body = payload.substring(objStart, objEnd + 1);
+
+    auto getInt = [&](const char* k, int def) -> int {
+      String key = String("\"") + k + "\":";
+      int i = body.indexOf(key);
+      if (i < 0) return def;
+      i += key.length();
+      while (i < (int)body.length() && body[i] == ' ') i++;
+      int e = i;
+      while (e < (int)body.length() && (isdigit(body[e]) || body[e] == '-')) e++;
+      if (e == i) return def;
+      return body.substring(i, e).toInt();
+    };
+    auto getStr = [&](const char* k) -> String {
+      String key = String("\"") + k + "\":\"";
+      int i = body.indexOf(key);
+      if (i < 0) return String("");
+      i += key.length();
+      int e = body.indexOf('"', i);
+      if (e < 0) return String("");
+      return body.substring(i, e);
+    };
+
+    String t = getStr("t");
+    if (t.length() > 0) {
+      AppSched s = {};
+      strncpy(s.target, t.c_str(), sizeof(s.target) - 1);
+      s.sH = getInt("sh", 0);
+      s.sM = getInt("sm", 0);
+      s.eH = getInt("eh", 0);
+      s.eM = getInt("em", 0);
+      s.enabled = (getInt("e", 0) == 1);
+      String d = getStr("d");
+      s.daysMask = 0;
+      for (int i = 0; i < (int)d.length(); i++) {
+        char c = d.charAt(i);
+        if (c >= '0' && c <= '6') s.daysMask |= (1 << (c - '0'));
+      }
+      g_appSched[g_appSchedCount++] = s;
+    }
+    searchPos = objEnd;
+  }
+  Serial.printf("[APP_SCHED] parsed %d entries\n", g_appSchedCount);
+}
+
+void readAppSchedules() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (!appControlMode) return;
+  static unsigned long lastRead = 0;
+  if (millis() - lastRead < 30000) return;
+  lastRead = millis();
+
+  String url = String(FIREBASE_DB_BASE) + "/devices/" + deviceId + "/appSchedules.json";
+  WiFiClientSecure cl;
+  cl.setInsecure();
+  HTTPClient h;
+  h.begin(cl, url);
+  h.setTimeout(4000);
+  int code = h.GET();
+  if (code == 200) {
+    String body = h.getString();
+    parseAppSchedules(body);
+  }
+  h.end();
+}
+
+void runAppSchedules() {
+  if (!appControlMode) return;
+  if (g_appSchedCount == 0) return;
+  DateTime now = rtc.now();
+  int dow = now.dayOfTheWeek();
+  int hh  = now.hour();
+  int mm  = now.minute();
+  int curMin = dow * 1440 + hh * 60 + mm;
+  static int lastFiredMin = -1;
+  if (curMin == lastFiredMin) return;
+  lastFiredMin = curMin;
+
+  for (int i = 0; i < g_appSchedCount; i++) {
+    AppSched& s = g_appSched[i];
+    if (!s.enabled) continue;
+    if (!(s.daysMask & (1 << dow))) continue;
+    if (s.sH == hh && s.sM == mm) {
+      setRelayState(String(s.target), true);
+      Serial.printf("[APP_SCHED] ON  %s %02d:%02d (dow=%d)\n", s.target, hh, mm, dow);
+    }
+    if (s.eH == hh && s.eM == mm) {
+      setRelayState(String(s.target), false);
+      Serial.printf("[APP_SCHED] OFF %s %02d:%02d (dow=%d)\n", s.target, hh, mm, dow);
+    }
+  }
 }
 
 int value, digit1, digit2, digit3;
@@ -439,6 +737,11 @@ extern float alert_set;
 const char* mode = "auto";
 const char* mode_senser = "ms";
 bool silen = false;
+// ===== App Control Mode =====
+// เมื่อเปิดอยู่ → บอร์ดจะถูกควบคุมจากแอพเท่านั้น (ปุ่มกายภาพถูกล็อก)
+// เปลี่ยนค่าได้จากแอพเท่านั้น ผ่าน /commands/appControlMode
+bool appControlMode = false;
+bool requestExitAppMode = false; // set true เมื่อ bt_2 กดออกจาก APP mode → readFirebaseCommands จะเขียน false ไป Firebase
 int windsensor = 0;
 const int led1 = 1;
 
@@ -453,6 +756,7 @@ lv_obj_t* lastScreen = nullptr;
 int currentDayIndex = 0; 
 int currentSlotIndex = 0; 
 bool needReloadPgSwitch = false;
+bool needPublishNvs = false;  // set ตอน save NVS จากปุ่มบนบอร์ด → publish ใน loop
 String dayOfWeek(int index) {
   switch (index) {
     case 0: return "Sun";
@@ -565,9 +869,45 @@ bool is_wind_zero_state = false;
 extern float rLow, rHigh;
 extern float nLow, nHigh;
 float windMPH;
+extern bool isMuteOpen;  // forward decl. (defined below near handle_mute_button)
 void readWind() {
+    // ----- Gate: ถ้าพัดลมยังไม่เปิด ให้ข้ามการอ่านเซ็นเซอร์ทั้งหมด -----
+    // (ไม่อ่าน analog, ไม่แสดงค่าเซ็นเซอร์, ไม่สั่ง FAN_HIGH/FAN_LOW)
+    static bool wasFanOff = false;
+    bool fanOn = (objects.fan != NULL) && lv_obj_has_state(objects.fan, LV_STATE_CHECKED);
+    if (!fanOn) {
+        smoothedWindMs = 0;
+        smoothedWindFt = 0;
+        windms = 0;
+        is_wind_zero_state = false;
+        if (!wasFanOff) {
+            // อัปเดต UI ครั้งเดียวตอนพัดลมเพิ่งดับ เพื่อไม่สแปม LVGL/I2C
+            if (objects.senser) {
+                lv_obj_set_style_text_font(objects.senser, &ui_font_thai_18, 0);
+                lv_label_set_text(objects.senser, "FAN OFF");
+            }
+            if (objects.speed) lv_obj_clear_state(objects.speed, LV_STATE_CHECKED);
+            if (objects.m_fan) {
+                lv_obj_set_style_text_font(objects.m_fan, &ui_font_thai_18, 0);
+                lv_label_set_text(objects.m_fan, "OFF");
+            }
+            // ดับ 7-segment ทั้งหมด (active LOW → 0xFF = OFF)
+            sr.setAllHigh();
+            // led1 → INPUT (high-impedance) เมื่อปิดพัดลม → ดับสนิท
+            pinMode(led1, INPUT);
+            // sileN: ปิดพัดลม → buzzer Nano เงียบด้วย (ส่ง Mute: CLOSE → warring=false)
+            Serial2.println("Mute: CLOSE");
+            wasFanOff = true;
+        }
+        return;
+    }
+    if (wasFanOff) {
+        // เพิ่งเปิดพัดลม → คืน buzzer state ตามค่า isMuteOpen ปัจจุบัน
+        Serial2.println(isMuteOpen ? "Mute: OPEN" : "Mute: CLOSE");
+    }
+    wasFanOff = false;
+
     static bool isInitialized = false; 
-    pinMode(led1,OUTPUT);
     static float windFtPerMin = 0.0; 
     unsigned long currentMillis = millis();
     if (currentMillis - previousMillisWind >= windInterval) {
@@ -603,84 +943,72 @@ void readWind() {
     smoothedWindMs = (smoothedWindMs * (1.0 - filterFactor)) + (windms * filterFactor);
     smoothedWindFt = (smoothedWindFt * (1.0 - filterFactor)) + (windFtPerMin * filterFactor);
 
-    if (smoothedWindMs > alert_set ) {
+    // ----- Local LED (led1 / GPIO1): logic ใหม่ -----
+    // - fan ปิด → INPUT (จัดการที่ gate ด้านบน)
+    // - mute (silen) → OUTPUT LOW เงียบ
+    // - ลม < threshold → OUTPUT HIGH ติดค้าง (เตือนลมตก)
+    // - ลม >= threshold → OUTPUT LOW ติดค้าง (ลมแรงพอ)
+    pinMode(led1, OUTPUT);
+    if (silen) {
         digitalWrite(led1, LOW);
-        if (mode != "direct") {
-            // Serial2.println("WIND_LOW");
-        }
-    }
-        if (smoothedWindMs < alert_set ) {
+    } else if (smoothedWindMs < alert_set) {
         digitalWrite(led1, HIGH);
-        if (mode != "direct") {
-            // Serial2.println("WIND_HIGH");
+    } else {
+        digitalWrite(led1, LOW);
+    }
+
+    // ----- WIND_LOW / WIND_HIGH → Nano (คุม LED pin 7 + Buzzer) -----
+    // ส่งบน transition ข้าม threshold ทุกโหมด (auto + direct) เพื่อให้ LED แจ้งเตือนลมตกอัปเดตเสมอ
+    bool mode_is_auto = (objects.mode != NULL) && !lv_obj_has_state(objects.mode, LV_STATE_CHECKED);
+    if (is_wind_zero_state == false && smoothedWindMs < alert_set) {
+        Serial2.println("WIND_LOW");                  // → Nano: state=true → LED blink (ถ้าไม่ mute)
+        if (mode_is_auto) {
+            Serial2.println("FAN_HIGH");
+            if (objects.speed)  lv_obj_add_state(objects.speed, LV_STATE_CHECKED);
+            if (objects.m_fan) {
+                lv_obj_set_style_text_font(objects.m_fan, &ui_font_thai_18, 0);
+                lv_label_set_text(objects.m_fan, "HIGH");
+            }
         }
+        is_wind_zero_state = true;
+    } else if (is_wind_zero_state == true && smoothedWindMs >= alert_set) {
+        Serial2.println("WIND_HIGH");                 // → Nano: state=false → LED off
+        if (mode_is_auto) {
+            Serial2.println("FAN_LOW");
+            if (objects.speed)  lv_obj_clear_state(objects.speed, LV_STATE_CHECKED);
+            if (objects.m_fan) {
+                lv_obj_set_style_text_font(objects.m_fan, &ui_font_thai_18, 0);
+                lv_label_set_text(objects.m_fan, "AUTO");
+            }
+        }
+        is_wind_zero_state = false;
     }
 
     if (mode_senser == "ms") {
-        int display_digit = smoothedWindMs * 100; 
+        int display_digit = smoothedWindMs * 100;
 
-        if (smoothedWindMs <= 0.01) { 
-           textft("-L-");
-            if(objects.senser) lv_label_set_text(objects.senser, "0.00 M/s");
-            
-        } 
-        if (is_wind_zero_state == false && smoothedWindMs < alert_set) { 
-             if (!lv_obj_has_state(objects.mode, LV_STATE_CHECKED)) {
-                Serial2.println("WIND_LOW");
-                Serial2.println("FAN_HIGH");
-                lv_obj_add_state(objects.speed, LV_STATE_CHECKED);
-                lv_obj_set_style_text_font(objects.m_fan, &ui_font_thai_18, 0);
-                lv_label_set_text(objects.m_fan, "HIGH");
-                if(objects.senser) lv_label_set_text(objects.senser, "0.00 M/s");
-                textft("-L-");
-                is_wind_zero_state = true;
-             }
-         }
-        else {
-            if (is_wind_zero_state == true  && smoothedWindMs >= alert_set) {
-              if (!lv_obj_has_state(objects.mode, LV_STATE_CHECKED)) {
-                Serial2.println("WIND_HIGH");
-                Serial2.println("FAN_LOW");
-                lv_obj_clear_state(objects.speed, LV_STATE_CHECKED);
-                lv_obj_set_style_text_font(objects.m_fan, &ui_font_thai_18, 0);
-                lv_label_set_text(objects.m_fan, "AUTO");
-
-                is_wind_zero_state = false; 
-              }
-            }
-            
-            if (display_digit > 999) {
-                textft("-H-");
-                if(objects.senser) lv_label_set_text(objects.senser, "Over");
-            } 
-            if (display_digit < 999 && smoothedWindMs > alert_set){ 
-                digit(display_digit); 
-                char buf[32];
-                snprintf(buf, sizeof(buf), "%.2f M/s", smoothedWindMs);
-                
-                if(objects.senser) lv_label_set_text(objects.senser, buf);
-                // if(objects.senser_1) lv_label_set_text(objects.senser_1, buf);
-            }
+        if (smoothedWindMs <= 0.01) {
+            textft("-L-");
+            if (objects.senser) lv_label_set_text(objects.senser, "0.00 M/s");
+        } else if (display_digit > 999) {
+            textft("-H-");
+            if (objects.senser) lv_label_set_text(objects.senser, "Over");
+        } else if (smoothedWindMs > alert_set) {
+            digit(display_digit);
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%.2f M/s", smoothedWindMs);
+            if (objects.senser) lv_label_set_text(objects.senser, buf);
+        } else {
+            // < threshold: แสดง 0
+            if (objects.senser) lv_label_set_text(objects.senser, "0.00 M/s");
+            textft("-L-");
         }
     }
     if (mode_senser == "ft") {
         if (smoothedWindMs <= 0.01) {
             textft("-L-");
             if(objects.senser) lv_label_set_text(objects.senser, "0 FT/m");
-        } 
-
-        if (is_wind_zero_state == false && smoothedWindMs < alert_set) { 
-                Serial2.println("WIND_LOW");
-                if(objects.senser) lv_label_set_text(objects.senser, "0 FT/m");
-                textft("-L-");
-                is_wind_zero_state = true;
-         }
-        else {
-            if (is_wind_zero_state == true  && smoothedWindMs >= alert_set) {
-                Serial2.println("WIND_HIGH");
-                delay(200);
-                is_wind_zero_state = false; 
-            }
+        } else {
             if (smoothedWindFt > 999) {
                 textft("-H-");
                 if(objects.senser) lv_label_set_text(objects.senser, "Over");
@@ -731,6 +1059,7 @@ void handle_mute_button() {
         if (pressDuration > 50 && pressDuration < 3000 && isLongPressHandled == false) {
             
             isMuteOpen = !isMuteOpen;
+            silen = !isMuteOpen;   // silen = true เมื่อ mute (ปิดเสียง/LED ในตัวบอร์ด)
             
            if (isMuteOpen) {
                 warring = true; 
@@ -846,6 +1175,14 @@ void sync_state(lv_obj_t *src, lv_state_t state) {
     static bool prev_pump = false;
     static bool prev_spray = false;
     static bool prev_reserve = false;
+    static bool prev_mode = false;
+
+    // ตรวจจับการเปลี่ยน mode (auto/direct) → force push ทันที
+    bool curr_mode = (objects.mode != NULL) && lv_obj_has_state(objects.mode, LV_STATE_CHECKED);
+    if (curr_mode != prev_mode) {
+        prev_mode = curr_mode;
+        requestFirebasePush();
+    }
 
     static unsigned long fan_timer_start = 0;
     static bool fan_is_waiting = false;
@@ -863,6 +1200,7 @@ void sync_state(lv_obj_t *src, lv_state_t state) {
                 Serial2.println("FAN_OFF");
             }
             prev_fan = curr_fan; 
+            requestFirebasePush();
             
             fan_is_waiting = false;
         }
@@ -878,6 +1216,7 @@ void sync_state(lv_obj_t *src, lv_state_t state) {
             Serial2.println("LIGHT_OFF");
         }
         prev_light = curr_light;
+        requestFirebasePush();
     }
 
     bool curr_pump = lv_obj_has_state(objects.pump, LV_STATE_CHECKED);
@@ -888,6 +1227,7 @@ void sync_state(lv_obj_t *src, lv_state_t state) {
             Serial2.println("PUMP_OFF");
         }
         prev_pump = curr_pump;
+        requestFirebasePush();
     }
 
     bool curr_spray = lv_obj_has_state(objects.spray, LV_STATE_CHECKED);
@@ -898,6 +1238,7 @@ void sync_state(lv_obj_t *src, lv_state_t state) {
             Serial2.println("SPRAY_OFF");
         }
         prev_spray = curr_spray;
+        requestFirebasePush();
     }
 
     bool curr_reserve = lv_obj_has_state(objects.reserve, LV_STATE_CHECKED);
@@ -908,6 +1249,7 @@ void sync_state(lv_obj_t *src, lv_state_t state) {
             Serial2.println("RESERVE_OFF");
         }
         prev_reserve = curr_reserve;
+        requestFirebasePush();
     }
 
 }
@@ -1558,6 +1900,7 @@ void updatePgSwitch2x2() {
                 p.state[edit_slot_id] = 1;
 
                 saveSingleSlot(currentDayIndex, edit_slot_id, p);
+                needPublishNvs = true;  // trigger publish NVS → Firebase ใน loop
 
                 lv_scr_load_anim(objects.pg_switch, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
                 needReloadPgSwitch = true; 
@@ -1791,6 +2134,7 @@ void handleShortPressTask() {
     ProgramData p = loadProgram(currentDayIndex);
     p.state[shortPressSlot] = !p.state[shortPressSlot];
     saveSingleSlot(currentDayIndex, shortPressSlot, p);
+    needPublishNvs = true;  // trigger publish NVS → Firebase ใน loop
 
     if (p.state[shortPressSlot]) {
         lv_obj_add_state(sw_targets[shortPressSlot], LV_STATE_CHECKED);
@@ -1942,22 +2286,20 @@ bool wait_direac_btn = false;
 #define CUR_SCREEN lv_scr_act()
 void CT_mode() {
     if (!lvglPaused) lv_timer_handler(); // run LVGL background
-    
+
     unsigned long now = millis();
-    lv_obj_t* activeScreen = lv_scr_act(); // ï¿½Ö§Ë¹ï¿½Ò¨Í»Ñ¨ï¿½ØºÑ¹ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+    lv_obj_t* activeScreen = lv_scr_act(); // ดึงหน้าจอปัจจุบัน
 
     // ---------------------------------------------------------
-    // 1. ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Â¹Ë¹ï¿½ï¿½ï¿½ï¿½Ñ¡ (bt_1) - Global Navigation
+    // 1. ปุ่มเปลี่ยนหน้าจอ (bt_1) - Global Navigation (ทำงานแม้ในโหมด APP)
     // ---------------------------------------------------------
     static bool btn1_prev = false;
     if (digitalRead(bt_1) == HIGH) {
         if (!btn1_prev) {
             btn1_prev = true;
-            
-            // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ë¹ï¿½ï¿½ï¿½Ë¹ ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ë¹ï¿½Ò¶Ñ´ï¿½ï¿½
             if (activeScreen == objects.main && objects.main != NULL) {
                 loadScreen(SCREEN_ID_PG_WORK);
-                return; // ï¿½Í¡ï¿½Ò¡ï¿½Ñ§ï¿½ï¿½ï¿½Ñ¹ï¿½Ñ¹ï¿½ï¿½
+                return;
             } 
             else if (activeScreen == objects.pg_work && objects.pg_work != NULL) {
                 loadScreen(SCREEN_ID_PG_SENSER);
@@ -1970,6 +2312,33 @@ void CT_mode() {
         }
     } else {
         btn1_prev = false;
+    }
+
+    // ===== App Control Mode lock =====
+    // ถ้าโหมด App Control เปิดอยู่ → ล็อกปุ่มทั้งหมด ยกเว้น bt_1 (เปลี่ยนหน้า) และ bt_2 (ออกโหมด)
+    if (appControlMode) {
+        // bt_2: กดปุ่มโหมด → ออก APP mode ทันที เข้าโหมด DIRECT
+        static bool btn2_exit_prev = false;
+        if (digitalRead(bt_2) == HIGH) {
+            if (!btn2_exit_prev) {
+                btn2_exit_prev = true;
+                appControlMode = false;
+                requestExitAppMode = true; // แจ้งให้ readFirebaseCommands เขียน false ไป Firebase
+                if (objects.mode != NULL) lv_obj_add_state(objects.mode, LV_STATE_CHECKED);
+                if (objects.mode_label != NULL) lv_label_set_text(objects.mode_label, "DIRECT");
+                Serial.println("[APP_CTRL] bt_2 pressed -> exit APP mode -> DIRECT");
+            }
+        } else {
+            btn2_exit_prev = false;
+        }
+        // อัปเดตป้าย mode_label เป็น "APP" ถ้ายังอยู่ในโหมด
+        if (appControlMode && objects.mode_label) {
+            const char* cur = lv_label_get_text(objects.mode_label);
+            if (!cur || strcmp(cur, "APP") != 0) {
+                lv_label_set_text(objects.mode_label, "APP");
+            }
+        }
+        return; // ล็อกปุ่มอื่นๆ ทั้งสิ้น
     }
 
     // ---------------------------------------------------------
@@ -2279,10 +2648,8 @@ static lv_obj_t * alarm_overlay          = NULL;
 static lv_obj_t * alarm_disp_label[3]   = {NULL, NULL, NULL};
 // Alarm active states — non-static so Firebase send can read them
 bool alarm_active[3]        = {false, false, false};
-// Timestamp ที่จุดหาซีรีทอธ (detect การตัดจำหน่าย)
-unsigned long last_serial_read_time = 0;
-#define POWER_LOSS_TIMEOUT_MS 3500UL  // 3.5 วินาทีไม่ได้ Serial2 สัญญาณ → คงสัญญาณตัดจำหน่าย (power loss)
-static const char * const alarm_label_text[3] = {"Alram_1", "Alram_2", "Alram_3"};
+// alarm latches ON until explicit Alarm_X_OFF from Serial2 or clearAlarms from Firebase
+static const char * const alarm_label_text[3] = {"Alarm_1", "Alarm_2", "Alarm_3"};
 
 #define ALARM_ROW_H  60
 #define ALARM_PAD    10
@@ -2362,52 +2729,46 @@ void Read_nano(){
             if(incomingData == "Alarm_1_ON") {
                 ensure_alarm_overlay();
                 alarm_active[0] = true;
-                last_serial_read_time = millis();
                 update_alarm_overlay();
-                sendAlarmStatusImmediately();  // ส่ง Firebase ทันที
+                sendAlarmStatusImmediately();
                 if(timer_1 == NULL) timer_1 = lv_timer_create(blink_specific_cb, 500, (void*)(intptr_t)0);
             }
             if(incomingData == "Alarm_1_OFF") {
                 stop_blink(timer_1, objects.alram_1);
                 alarm_active[0] = false;
-                last_serial_read_time = millis();
                 if (alarm_disp_label[0]) lv_obj_set_style_opa(alarm_disp_label[0], LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_DEFAULT);
                 update_alarm_overlay();
-                sendAlarmStatusImmediately();  // ส่ง Firebase ทันที
+                sendAlarmStatusImmediately();
             }
             // --- Alarm 2 ---
             if(incomingData == "Alarm_2_ON") {
                 ensure_alarm_overlay();
                 alarm_active[1] = true;
-                last_serial_read_time = millis();
                 update_alarm_overlay();
-                sendAlarmStatusImmediately();  // ส่ง Firebase ทันที
+                sendAlarmStatusImmediately();
                 if(timer_2 == NULL) timer_2 = lv_timer_create(blink_specific_cb, 500, (void*)(intptr_t)1);
             }
             if(incomingData == "Alarm_2_OFF") {
                 stop_blink(timer_2, objects.alram_2);
                 alarm_active[1] = false;
-                last_serial_read_time = millis();
                 if (alarm_disp_label[1]) lv_obj_set_style_opa(alarm_disp_label[1], LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_DEFAULT);
                 update_alarm_overlay();
-                sendAlarmStatusImmediately();  // ส่ง Firebase ทันที
+                sendAlarmStatusImmediately();
             }
             // --- Alarm 3 ---
             if(incomingData == "Alarm_3_ON") {
                 ensure_alarm_overlay();
                 alarm_active[2] = true;
-                last_serial_read_time = millis();
                 update_alarm_overlay();
-                sendAlarmStatusImmediately();  // ส่ง Firebase ทันที
+                sendAlarmStatusImmediately();
                 if(timer_3 == NULL) timer_3 = lv_timer_create(blink_specific_cb, 500, (void*)(intptr_t)2);
             }
             if(incomingData == "Alarm_3_OFF") {
                 stop_blink(timer_3, objects.alram_3);
                 alarm_active[2] = false;
-                last_serial_read_time = millis();
                 if (alarm_disp_label[2]) lv_obj_set_style_opa(alarm_disp_label[2], LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_DEFAULT);
                 update_alarm_overlay();
-                sendAlarmStatusImmediately();  // ส่ง Firebase ทันที
+                sendAlarmStatusImmediately();
             }
         }
 }
@@ -2596,6 +2957,8 @@ void loop(){
     if (millis() - lastRTC >= 1000) {
         lastRTC = millis();
         timer();
+        // [APP CONTROL] เรียกทุกหน้า เพื่อให้รับ/ส่งคำสั่ง appControlMode ได้แม้ไม่ได้อยู่หน้า MAIN
+        readFirebaseCommands();
         
         if (CUR_SCREEN == objects.main) {
             if (!isOnMainScreen) {
@@ -2603,14 +2966,12 @@ void loop(){
                 mainScreenEnterTime = millis();
             }
             
-            // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Í¹ï¿½ï¿½ && hasReadWind ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ readWind() ï¿½Ó§Ò¹ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ò§ï¿½ï¿½ï¿½ï¿½ 1 ï¿½ï¿½ï¿½ï¿½ï¿½
-            // ก่อน checkAndRunSchedule() ให้เรียก readFirebaseCommands() ก่อน
-            // เพื่อให้ directMode state ถูกอัปเดตจาก Firebase ก่อนตรวจสอบ
-            readFirebaseCommands();
+            // [APP SCHED] อ่านตารางจากแอพ + รันตามเวลา (เฉพาะ App Control mode)
+            readAppSchedules();
+            runAppSchedules();
             if (millis() - mainScreenEnterTime > 3000 && hasReadWind) {
                 recheckupdata();
-                checkAndRunSchedule();
-                
+                checkAndRunSchedule();                
                 // ï¿½Ò¡ï¿½ï¿½Í§ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Í¡ï¿½ï¿½ï¿½ï¿½Ò¹ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Íºï¿½Ñ´ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½Ã¶ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ flag ï¿½Ã§ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
                 // hasReadWind = false; 
             }
@@ -2639,35 +3000,22 @@ void loop(){
         lastLVGL = millis();
         lv_timer_handler();
     }
-    // ---- WiFi auto-reconnect ----
+    // ---- WiFi auto-reconnect (non-blocking) + one-shot connected hook ----
     static unsigned long lastWiFiCheck = 0;
-    if (millis() - lastWiFiCheck > 15000) {
+    if (millis() - lastWiFiCheck > 10000) {
         lastWiFiCheck = millis();
         if (WiFi.status() != WL_CONNECTED) {
-            Serial.println("[WiFi] Reconnecting...");
-            connectToWiFi();
+            Serial.println("[WiFi] Reconnecting (async)...");
+            connectToWiFi();   // non-blocking: kicks off WiFi.begin() and returns
+        } else {
+            onWiFiConnectedOnce();   // publish schedule first time we see WL_CONNECTED
         }
-    }
-    // ---- Power Loss Detection ----
-    {
-      bool needUpdate = false;
-      unsigned long now_ms = millis();
-      
-      // Detect power loss: ไม่ได้สัญญาณ Serial2 เกิน 3.5 วินาที -> clear all alarms (ตัดจำหน่าย)
-      if (last_serial_read_time > 0 && (now_ms - last_serial_read_time > POWER_LOSS_TIMEOUT_MS)) {
-        // Power loss detected
-        for (int i = 0; i < 3; i++) {
-          if (alarm_active[i]) {
-            Serial.printf("[ALARM] Power loss detected - clearing alarm %d\n", i+1);
-            alarm_active[i] = false;
-            needUpdate = true;
-          }
-        }
-        last_serial_read_time = 0;  // Reset counter
-      }
-      if (needUpdate) update_alarm_overlay();
     }
     // ---- Firebase ----
+    if (needPublishNvs && WiFi.status() == WL_CONNECTED) {
+      needPublishNvs = false;
+      publishNvsScheduleToFirebase();
+    }
     sendSensorData();
     // readFirebaseCommands(); ← ย้ายไปอยู่ด้านบนก่อน checkAndRunSchedule แล้ว
     // ------------------
