@@ -1,0 +1,8 @@
+[{
+  "relation": ["delegate_permission/common.handle_all_urls"],
+  "target": {
+    "namespace": "android_app",
+    "package_name": "com.fumhood.ble",
+    "sha256_cert_fingerprints": ["2B:F2:55:85:FE:97:96:35:9D:8F:9A:6C:A7:9D:EC:27:56:86:6E:8D:E3:2C:8D:C0:73:3B:95:3F:15:45:B4:80"]
+  }
+}]

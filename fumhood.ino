@@ -9,6 +9,17 @@
 #include <HTTPClient.h>
 #include "esp_efuse.h"
 #include "esp_mac.h"
+
+// ============ BLE-only build ============
+// 1 = ปิด WiFi/Firebase, ควบคุมผ่าน BLE (web app via Web Bluetooth) แทน
+// 0 = ใช้ WiFi/Firebase ตามเดิม
+#define BLE_ONLY 1
+#if BLE_ONLY
+// NimBLE แทน Bluedroid — ประหยัด heap ~70KB (no-PSRAM)
+// สถาปัตยกรรม: BLE เท่านั้น — Android ใช้แอป (TWA), iPhone ใช้ Bluefy, QR ระบุเครื่อง
+#include <NimBLEDevice.h>
+#endif
+
 #define M5GFX_USING_REAL_LVGL
 #define LGFX_USE_V1 1
 #include "LGFX_ILI9488_S3.hpp"
@@ -490,13 +501,19 @@ void readFirebaseCommands() {
         p.spray[s]   = getInt("spray",   p.spray[s]);
         p.reserve[s] = getInt("reserve", p.reserve[s]);
         p.state[s]   = getInt("state",   p.state[s]);
-        saveSingleSlot(d, s, p);
-        Serial.printf("[NVS_EDIT] saved d=%d s=%d %02d:%02d-%02d:%02d state=%d\n",
-                      d, s, p.hour_start[s], p.minute_start[s],
-                      p.hour_end[s], p.minute_end[s], p.state[s]);
-        // invalidate cache ทันที เพื่อให้ checkAndRunSchedule() โหลด schedule ใหม่ในรอบถัดไป
-        recheckupdata();
-        didScheduleEdit = true;
+        // validate time ranges ก่อนเขียน (mirror BLE SCHED validation)
+        if (p.hour_start[s] < 0 || p.hour_start[s] > 23 || p.hour_end[s] < 0 || p.hour_end[s] > 23 ||
+            p.minute_start[s] < 0 || p.minute_start[s] > 59 || p.minute_end[s] < 0 || p.minute_end[s] > 59) {
+          Serial.println("[NVS_EDIT] rejected: time out of range");
+        } else {
+          saveSingleSlot(d, s, p);
+          Serial.printf("[NVS_EDIT] saved d=%d s=%d %02d:%02d-%02d:%02d state=%d\n",
+                        d, s, p.hour_start[s], p.minute_start[s],
+                        p.hour_end[s], p.minute_end[s], p.state[s]);
+          // invalidate cache ทันที เพื่อให้ checkAndRunSchedule() โหลด schedule ใหม่ในรอบถัดไป
+          recheckupdata();
+          didScheduleEdit = true;
+        }
       }
     }
   }
@@ -894,6 +911,7 @@ void readWind() {
     // ----- Gate: ถ้าพัดลมยังไม่เปิด ให้ข้ามการอ่านเซ็นเซอร์ทั้งหมด -----
     // (ไม่อ่าน analog, ไม่แสดงค่าเซ็นเซอร์, ไม่สั่ง FAN_HIGH/FAN_LOW)
     static bool wasFanOff = false;
+    static bool led1_is_output = false;   // led1 = OUTPUT เฉพาะตอนอ่านค่าจริง; ไม่งั้น INPUT (ไม่ติดไฟทั้ง HIGH/LOW)
     bool fanOn = (objects.fan != NULL) && lv_obj_has_state(objects.fan, LV_STATE_CHECKED);
     if (!fanOn) {
         smoothedWindMs = 0;
@@ -913,21 +931,36 @@ void readWind() {
             }
             // ดับ 7-segment ทั้งหมด (active LOW → 0xFF = OFF)
             sr.setAllHigh();
-            // led1 → INPUT (high-impedance) เมื่อปิดพัดลม → ดับสนิท
+            // led1 → INPUT (high-impedance) เมื่อปิดพัดลม → ดับสนิท (ไม่ติดทั้ง HIGH/LOW)
             pinMode(led1, INPUT);
+            led1_is_output = false;
             // sileN: ปิดพัดลม → buzzer Nano เงียบด้วย (ส่ง Mute: CLOSE → warring=false)
             Serial2.println("Mute: CLOSE");
             wasFanOff = true;
         }
         return;
     }
+    static unsigned long fanOnTime = 0;
     if (wasFanOff) {
-        // เพิ่งเปิดพัดลม → คืน buzzer state ตามค่า isMuteOpen ปัจจุบัน
+        // เพิ่งเปิดพัดลม → คืน buzzer state ตามค่า isMuteOpen ปัจจุบัน (ยังไม่แตะ led1 — รอ warm-up)
         Serial2.println(isMuteOpen ? "Mute: OPEN" : "Mute: CLOSE");
-        // คืนค่า led1 เป็น OUTPUT เพื่อให้กลับมาคุมแสง
-        pinMode(led1, OUTPUT);
+        Serial2.print("BUZZ:"); Serial2.println(buzz_mode);   // re-sync pattern เผื่อ Nano reset ระหว่างทาง
+        fanOnTime = millis();   // เริ่มจับเวลา warm-up 5 วิ ก่อนเริ่มอ่าน/แสดงค่า
     }
     wasFanOff = false;
+
+    // warm-up 5 วิ หลังเปิดพัดลม → ยังไม่อ่าน/แสดงค่า แสดง "Wait.." (กันค่าพุ่งช่วง fan spin-up)
+    // led1 ต้องเป็น INPUT ตลอดช่วงนี้ → ไม่ให้ติดไฟทั้ง HIGH และ LOW จนกว่าจะเริ่มอ่านจริง
+    if (millis() - fanOnTime < 5000) {
+        smoothedWindMs = 0;
+        smoothedWindFt = 0;
+        if (led1_is_output) { pinMode(led1, INPUT); led1_is_output = false; }
+        if (objects.senser) {
+            lv_obj_set_style_text_font(objects.senser, &ui_font_thai_18, 0);
+            lv_label_set_text(objects.senser, "Wait..");
+        }
+        return;
+    }
 
     static bool isInitialized = false; 
     static float windFtPerMin = 0.0; 
@@ -971,9 +1004,8 @@ void readWind() {
     // - ลม >= threshold → OUTPUT LOW (ลมแรงพอ)
     // (silen ไม่มีผลต่อ LED — ปิดแค่เสียง buzzer เท่านั้น)
     // หมายเหตุ: ไม่เรียก pinMode ทุก 30ms — ตั้งครั้งเดียวตอนเปลี่ยนจาก INPUT → OUTPUT
-    static bool led1_is_output = false;
     if (!led1_is_output) {
-        pinMode(led1, OUTPUT);
+        pinMode(led1, OUTPUT);   // ผ่าน warm-up แล้ว → คืน led1 เป็น OUTPUT เริ่มคุมไฟ
         led1_is_output = true;
     }
     static int8_t last_led1 = -1;
@@ -1035,19 +1067,18 @@ void readWind() {
         if (smoothedWindMs <= 0.01) {
             textft("-L-");
             if(objects.senser) lv_label_set_text(objects.senser, "0 FT/m");
+        } else if (smoothedWindFt > 999) {
+            textft("-H-");
+            if(objects.senser) lv_label_set_text(objects.senser, "Over");
+        } else if (smoothedWindMs > alert_set) {
+            digitft((int)smoothedWindFt);
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%.0f FT/m", smoothedWindFt);
+            if(objects.senser) lv_label_set_text(objects.senser, buf);
         } else {
-            if (smoothedWindFt > 999) {
-                textft("-H-");
-                if(objects.senser) lv_label_set_text(objects.senser, "Over");
-            } 
-            if (smoothedWindFt < 999 && smoothedWindMs > alert_set){
-                digitft((int)smoothedWindFt);
-   
-                char buf[32];
-                snprintf(buf, sizeof(buf), "%.0f FT/m", smoothedWindFt);
-                
-                if(objects.senser) lv_label_set_text(objects.senser, buf);
-            }
+            // below alert threshold: แสดง 0 กันค่าค้างต่ำกว่า alert (mirror MS branch)
+            textft("-L-");
+            if(objects.senser) lv_label_set_text(objects.senser, "0 FT/m");
         }
     }
 }
@@ -1085,24 +1116,30 @@ void handle_mute_button() {
         unsigned long pressDuration = millis() - pressStartTime;
         if (pressDuration > 50 && pressDuration < 3000 && isLongPressHandled == false) {
             
-            isMuteOpen = !isMuteOpen;
-            silen = !isMuteOpen;   // silen = true เมื่อ mute (ปิดเสียง/LED ในตัวบอร์ด)
-            
-           if (isMuteOpen) {
-                warring = true; 
-                lv_obj_clear_state(objects.sound_1, LV_STATE_CHECKED);
-                // lv_obj_clear_state(objects.sound_2, LV_STATE_CHECKED);
-                
-                Serial2.println("Mute: OPEN"); 
+            // mute มีผลเฉพาะตอนพัดลมเปิด — พัดลมดับ กด mute ทางใดก็ต้องไม่มีเสียงออก
+            bool fanOn = (objects.fan != NULL) && lv_obj_has_state(objects.fan, LV_STATE_CHECKED);
+            if (!fanOn) {
+                Serial2.println("Mute: CLOSE");   // ย้ำ buzzer Nano เงียบ กันเสียงหลุดตอนพัดลมดับ
             } else {
-                warring = false;
-                lv_obj_add_state(objects.sound_1, LV_STATE_CHECKED);
-                // lv_obj_add_state(objects.sound_2, LV_STATE_CHECKED);
-                
-                Serial2.println("Mute: CLOSE"); 
+                isMuteOpen = !isMuteOpen;
+                silen = !isMuteOpen;   // silen = true เมื่อ mute (ปิดเสียง/LED ในตัวบอร์ด)
+
+               if (isMuteOpen) {
+                    warring = true;
+                    lv_obj_clear_state(objects.sound_1, LV_STATE_CHECKED);
+                    // lv_obj_clear_state(objects.sound_2, LV_STATE_CHECKED);
+
+                    Serial2.println("Mute: OPEN");
+                } else {
+                    warring = false;
+                    lv_obj_add_state(objects.sound_1, LV_STATE_CHECKED);
+                    // lv_obj_add_state(objects.sound_2, LV_STATE_CHECKED);
+
+                    Serial2.println("Mute: CLOSE");
+                }
+                lv_obj_invalidate(objects.sound_1);
+                // lv_obj_invalidate(objects.sound_2);
             }
-            lv_obj_invalidate(objects.sound_1);
-            // lv_obj_invalidate(objects.sound_2);
         }
         delay(50);
     }
@@ -1189,6 +1226,10 @@ void bt() {
   }
 }
 
+// Fan-first interlock: true หลัง fan spin-up เสร็จ (ส่ง FAN_ON ไป Nano แล้ว ~5s)
+// → DIRECT mode อนุญาตให้กด light/pump/spray/speed/reserve ได้เฉพาะตอน fan_powered == true
+bool fan_powered = false;
+
 void sync_state(lv_obj_t *src, lv_state_t state) {
     // [BUG 4] removed dead code (had been redundantly setting state to itself)
 
@@ -1210,6 +1251,48 @@ void sync_state(lv_obj_t *src, lv_state_t state) {
     static bool fan_is_waiting = false;
     
     bool curr_fan = lv_obj_has_state(objects.fan, LV_STATE_CHECKED);
+
+    // ===== Fan-first interlock: fan ดับที่ UI → ตัด fan_powered + cascade off ตัวอื่นทันที =====
+    // cascade เฉพาะ DIRECT mode (AUTO = schedule คุมเอง / APP = app คุมเอง → ไม่แตะ กัน flicker)
+    static bool prev_fan_ui = false;
+    if (curr_fan != prev_fan_ui) {
+        prev_fan_ui = curr_fan;
+        if (!curr_fan) {
+            fan_powered = false;
+            // [BUG 2] HARD interlock: ไม่มีลม → pump/spray ต้องดับเสมอทุกโหมด (DIRECT/AUTO/APP)
+            // contaminant actuators ห้ามทำงานโดยไม่มี airflow → clear state ที่นี่ไม่ขึ้นกับโหมด
+            // edge-detect ข้างล่างจะยิง PUMP_OFF/SPRAY_OFF ไป Nano เอง
+            lv_obj_t* hard_off[][2] = {
+                { objects.pump,  objects.panel_pump  },
+                { objects.spray, objects.panel_spray },
+            };
+            for (auto& d : hard_off) {
+                if (d[0]) lv_obj_clear_state(d[0], LV_STATE_CHECKED);
+                if (d[1]) lv_obj_clear_state(d[1], LV_STATE_CHECKED);
+            }
+            bool direct_mode =
+                (objects.mode && lv_obj_has_state(objects.mode, LV_STATE_CHECKED)) && !appControlMode;
+            if (direct_mode) {
+                // light/reserve: clear state → edge-detect ข้างล่างยิง *_OFF ไป Nano เอง
+                // (pump/spray ถูก clear ไปแล้วด้านบนแบบ hard interlock)
+                lv_obj_t* casc[][2] = {
+                    { objects.light,   objects.panel_light   },
+                    { objects.reserve, objects.panel_reserve },
+                };
+                for (auto& d : casc) {
+                    if (d[0]) lv_obj_clear_state(d[0], LV_STATE_CHECKED);
+                    if (d[1]) lv_obj_clear_state(d[1], LV_STATE_CHECKED);
+                }
+                // speed: ไม่มี edge-detect ใน sync_state → ส่ง FAN_LOW + reset label m_fan เอง
+                if (objects.speed && lv_obj_has_state(objects.speed, LV_STATE_CHECKED)) {
+                    lv_obj_clear_state(objects.speed, LV_STATE_CHECKED);
+                    if (objects.m_fan) lv_label_set_text(objects.m_fan, "LOW");
+                    Serial2.println("FAN_LOW");
+                }
+            }
+        }
+    }
+
     if (curr_fan != prev_fan) {
         if (fan_is_waiting == false) {
             fan_timer_start = millis();
@@ -1218,12 +1301,14 @@ void sync_state(lv_obj_t *src, lv_state_t state) {
         if (millis() - fan_timer_start >= 5000) {
             if(curr_fan) {
                 Serial2.println("FAN_ON");
+                fan_powered = true;   // spin-up เสร็จ → ปลดบล็อก interlock (ไฟจ่ายตัวอื่นได้)
             } else {
                 Serial2.println("FAN_OFF");
+                fan_powered = false;
             }
-            prev_fan = curr_fan; 
+            prev_fan = curr_fan;
             requestFirebasePush();
-            
+
             fan_is_waiting = false;
         }
     } else {
@@ -2401,12 +2486,14 @@ void CT_mode() {
         // ï¿½ï¿½Ã¤Çºï¿½ï¿½ï¿½ï¿½Ø»ï¿½Ã³ï¿½ (Manual)
         if (objects.mode != NULL && lv_obj_has_state(objects.mode, LV_STATE_CHECKED)) {
             simple_toggle(objects.fan,objects.panel_fan,  bt_3);
-            simple_toggle(objects.light,objects.panel_light, bt_4);
-            simple_toggle(objects.pump,objects.panel_pump,  bt_7);
-            simple_toggle(objects.spray,objects.panel_spray, bt_6);
-            simple_toggle(objects.speed,objects.speed, bt_5);
-            simple_toggle(objects.reserve,objects.panel_reserve, bt_20);
-            
+            // Fan-first interlock: ตัวอื่นกดได้เฉพาะเมื่อ fan จ่ายไฟแล้ว (spin-up เสร็จ ~5s)
+            if (fan_powered) {
+                simple_toggle(objects.light,objects.panel_light, bt_4);
+                simple_toggle(objects.pump,objects.panel_pump,  bt_7);
+                simple_toggle(objects.spray,objects.panel_spray, bt_6);
+                simple_toggle(objects.speed,objects.speed, bt_5);
+                simple_toggle(objects.reserve,objects.panel_reserve, bt_20);
+            }
         }
     }
 
@@ -2515,6 +2602,488 @@ void state_device(){
     sync_state(objects.spray, LV_STATE_CHECKED);
     sync_state(objects.reserve, LV_STATE_CHECKED);
 }
+
+// ===================== BLE control (Web Bluetooth) =====================
+// Nordic UART Service (NUS) — phone(web app) <-> device
+//   RX (Write)  : phone -> device, command lines "FAN:1" / "LIGHT:0" / ...
+//   TX (Notify) : device -> phone, status JSON
+// คำสั่งถูก parse ใน loop context (blePoll) ไม่ใช่ใน BLE callback — กัน LVGL ไม่ thread-safe
+#if BLE_ONLY
+#define BLE_SVC_UUID "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
+#define BLE_RX_UUID  "6e400002-b5a3-f393-e0a9-e50e24dcca9e"  // write  (phone -> device)
+#define BLE_TX_UUID  "6e400003-b5a3-f393-e0a9-e50e24dcca9e"  // notify (device -> phone)
+
+bool bleControlMode = false;                       // คู่ขนาน appControlMode: gate การสั่งงาน
+static NimBLECharacteristic* bleTxChar = nullptr;
+static volatile bool bleClientConnected = false;
+static char bleCmdBuf[192] = {0};                  // fixed buffer shared by NimBLE host task & loop task
+static volatile bool bleCmdReady = false;
+static portMUX_TYPE bleCmdMux = portMUX_INITIALIZER_UNLOCKED;  // guards bleCmdBuf/bleCmdReady across tasks
+static unsigned long bleLastCmdTime = 0;           // คำสั่งล่าสุดจากมือถือ (timeout 30 นาที → AUTO)
+static void bleNotify();   // forward decl (เรียกใน bleHandleCommand)
+
+// กลับสู่โหมด AUTO (ใช้ตอนออกโหมดควบคุม / timeout)
+static void bleRevertToAuto() {
+    if (objects.mode && lv_obj_has_state(objects.mode, LV_STATE_CHECKED))
+        lv_obj_clear_state(objects.mode, LV_STATE_CHECKED);
+    if (objects.mode_label) lv_label_set_text(objects.mode_label, "AUTO");
+    recheckupdata();   // ให้ schedule คุมต่อทันทีรอบถัดไป
+}
+
+// flip LVGL CHECKED ของ obj ให้ตรง desired (mirror applyIfChanged ใน readFirebaseCommands)
+static void bleSetState(lv_obj_t* obj, bool desired) {
+    if (!obj) return;
+    bool cur = lv_obj_has_state(obj, LV_STATE_CHECKED);
+    if (cur != desired) {
+        if (desired) lv_obj_add_state(obj, LV_STATE_CHECKED);
+        else         lv_obj_clear_state(obj, LV_STATE_CHECKED);
+    }
+}
+static void bleApplyRelay(lv_obj_t* obj, lv_obj_t* pnl, bool on) {
+    bleSetState(obj, on);
+    bleSetState(pnl, on);
+}
+
+// ส่ง string ดิบผ่าน TX notify (ใช้ตอบ schedule slot)
+static void bleSendStr(const String& s) {
+    if (!bleClientConnected || !bleTxChar) return;
+    bleTxChar->setValue((uint8_t*)s.c_str(), s.length());
+    bleTxChar->notify();
+}
+// ตอบ 1 slot ของ NVS schedule: {"sd":d,"ss":s,"v":[hs,ms,he,me,fan,light,pump,spray,reserve,state]}
+static void bleSendSlot(int d, int s) {
+    if (d < 0 || d >= 7 || s < 0 || s >= 6) return;
+    ProgramData p = loadProgram(d);
+    String j = "{\"sd\":" + String(d) + ",\"ss\":" + String(s) + ",\"v\":[";
+    j += String(p.hour_start[s])   + "," + String(p.minute_start[s]) + ",";
+    j += String(p.hour_end[s])     + "," + String(p.minute_end[s])   + ",";
+    j += String(p.fan[s])     + "," + String(p.light[s])  + "," + String(p.pump[s]) + ",";
+    j += String(p.spray[s])   + "," + String(p.reserve[s])+ "," + String(p.state[s]);
+    j += "]}";
+    bleSendStr(j);
+}
+
+class BleServerCb : public NimBLEServerCallbacks {
+    void onConnect(NimBLEServer* s, NimBLEConnInfo& ci) override {
+        bleClientConnected = true;  Serial.println("[BLE] client connected");
+    }
+    void onDisconnect(NimBLEServer* s, NimBLEConnInfo& ci, int reason) override {
+        bleClientConnected = false; Serial.println("[BLE] client disconnected");
+        NimBLEDevice::startAdvertising();   // re-advertise ให้ต่อใหม่
+    }
+};
+class BleRxCb : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic* c, NimBLEConnInfo& ci) override {
+        // runs on the NimBLE host task — copy into the shared buffer under a spinlock
+        // so blePoll() (loop task) never reads a half-written/reallocated buffer (use-after-free)
+        auto av = c->getValue();
+        if (av.length()) {
+            portENTER_CRITICAL(&bleCmdMux);
+            strlcpy(bleCmdBuf, av.c_str(), sizeof(bleCmdBuf));
+            bleCmdReady = true;
+            portEXIT_CRITICAL(&bleCmdMux);
+        }
+    }
+};
+
+// parse + apply 1 บรรทัดคำสั่ง — mirror readFirebaseCommands appControlMode path
+static void bleHandleCommand(const String& raw) {
+    String cmd = raw; cmd.trim();
+    if (cmd.length() == 0) return;
+    int colon = cmd.indexOf(':');
+    String key = (colon >= 0) ? cmd.substring(0, colon) : cmd;
+    String val = (colon >= 0) ? cmd.substring(colon + 1) : "";
+    key.trim(); val.trim();
+    bool on = (val == "1" || val.equalsIgnoreCase("true") || val.equalsIgnoreCase("on"));
+
+    if (key == "CTRL") {                          // เข้า/ออก BLE control mode
+        bleControlMode = on;
+        if (on) {
+            bleLastCmdTime = millis();
+            if (objects.mode_label) {
+                bool d = objects.mode && lv_obj_has_state(objects.mode, LV_STATE_CHECKED);
+                lv_label_set_text(objects.mode_label, d ? "DIRECT" : "AUTO");
+            }
+        } else {
+            bleRevertToAuto();                    // ปิดโหมดควบคุม → กลับ AUTO ก่อนเสมอ
+        }
+        Serial.printf("[BLE] CTRL -> %s\n", on ? "ON" : "OFF");
+        return;
+    }
+    bleLastCmdTime = millis();                    // ทุกคำสั่ง = ยังมีการควบคุมอยู่ (รีเซ็ต timeout)
+    if (key == "CLEARALARM") {                    // เคลียร์ alarm ได้ทุกโหมด (mirror clearAlarms)
+        for (int i = 0; i < 3; i++) alarm_active[i] = false;
+        update_alarm_overlay();
+        Serial.println("[BLE] clear alarms");
+        return;
+    }
+    if (key == "RTC") {                            // ตั้งเวลาเครื่อง (DS3231 + Preferences) — WiFi ปิด ตั้งมือ
+        // val = "y,mo,d,h,mn"
+        int t[5]; int n = 0, from = 0;
+        while (n < 5) {
+            int comma = val.indexOf(',', from);
+            String tok = (comma < 0) ? val.substring(from) : val.substring(from, comma);
+            t[n++] = tok.toInt();
+            if (comma < 0) break;
+            from = comma + 1;
+        }
+        // วันในเดือน (รวม leap year) สำหรับ validate วันที่
+        auto daysInMonth = [](int y, int mo) -> int {
+            static const int dm[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
+            if (mo < 1 || mo > 12) return 31;
+            int d = dm[mo - 1];
+            if (mo == 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0)) d = 29;
+            return d;
+        };
+        if (n == 5 && t[0] >= 2024 && t[1] >= 1 && t[1] <= 12
+            && t[3] >= 0 && t[3] <= 23 && t[4] >= 0 && t[4] <= 59
+            && t[2] >= 1 && t[2] <= daysInMonth(t[0], t[1])) {
+            saveTimeSettings(t[2], t[1], t[0], t[3], t[4]);   // (d, m, y, h, mn) → RTC + NVS
+            Serial.printf("[BLE] RTC set %04d-%02d-%02d %02d:%02d\n", t[0], t[1], t[2], t[3], t[4]);
+            bleNotify();                                       // ส่งเวลาใหม่กลับ
+        } else Serial.printf("[BLE] RTC bad: %s\n", val.c_str());
+        return;
+    }
+    if (key == "SCHEDGET") {                       // อ่าน NVS schedule วันหนึ่ง → ตอบ 6 slot
+        int d = val.toInt();
+        for (int s = 0; s < 6; s++) bleSendSlot(d, s);
+        return;
+    }
+    if (key == "SCHED") {                          // เขียน 1 slot ลง NVS (mirror scheduleEdit :494-510)
+        // val = "d,s,hs,ms,he,me,fan,light,pump,spray,reserve,state"
+        int v[12]; int n = 0, from = 0;
+        while (n < 12) {
+            int comma = val.indexOf(',', from);
+            String tok = (comma < 0) ? val.substring(from) : val.substring(from, comma);
+            v[n++] = tok.toInt();
+            if (comma < 0) break;
+            from = comma + 1;
+        }
+        if (n < 12) { Serial.printf("[BLE] SCHED bad (%d fields)\n", n); return; }
+        int d = v[0], s = v[1];
+        // validate ทุก field ก่อนเขียน NVS (toInt() คืน 0 เมื่อ input เพี้ยน → reject out-of-range)
+        if (d < 0 || d >= 7 || s < 0 || s >= 6) { Serial.printf("[BLE] SCHED bad day/slot d=%d s=%d\n", d, s); return; }
+        if (v[2] < 0 || v[2] > 23 || v[4] < 0 || v[4] > 23 ||      // hour_start / hour_end
+            v[3] < 0 || v[3] > 59 || v[5] < 0 || v[5] > 59) {      // minute_start / minute_end
+            Serial.println("[BLE] SCHED bad time"); return;
+        }
+        for (int k = 6; k < 12; k++) if (v[k] != 0 && v[k] != 1) {  // fan,light,pump,spray,reserve,state
+            Serial.printf("[BLE] SCHED bad flag idx=%d val=%d\n", k, v[k]); return;
+        }
+        {
+            ProgramData p = loadProgram(d);
+            p.hour_start[s]   = v[2];  p.minute_start[s] = v[3];
+            p.hour_end[s]     = v[4];  p.minute_end[s]   = v[5];
+            p.fan[s]   = v[6];  p.light[s] = v[7];  p.pump[s] = v[8];
+            p.spray[s] = v[9];  p.reserve[s] = v[10]; p.state[s] = v[11];
+            saveSingleSlot(d, s, p);               // → บันทึกลง NVS
+            recheckupdata();                       // invalidate cache ให้ schedule รอบถัดไปใช้ค่าใหม่
+            Serial.printf("[BLE] SCHED saved d=%d s=%d %02d:%02d-%02d:%02d state=%d\n",
+                          d, s, v[2], v[3], v[4], v[5], v[11]);
+            bleSendSlot(d, s);                      // echo กลับให้ web ยืนยัน
+        }
+        return;
+    }
+
+    if (key == "BUZZ") {                          // ตั้ง buzzer pattern (0-3) — เป็น setting ทำได้ไม่ต้องเข้า control mode
+        saveBuzzMode(val.toInt());                // clamp + เก็บ NVS
+        Serial2.print("BUZZ:"); Serial2.println(buzz_mode);   // forward ไป Nano
+        Serial.printf("[BLE] BUZZ -> %d\n", buzz_mode);
+        bleNotify();                              // ส่ง status ใหม่กลับให้ web sync
+        return;
+    }
+
+    // ตัวควบคุมที่เหลือต้องอยู่ใน BLE control mode (เหมือน gate appControlMode)
+    if (!bleControlMode) { Serial.printf("[BLE] ignored (not in CTRL): %s\n", cmd.c_str()); return; }
+
+    // MODE สลับ DIRECT/AUTO ได้เสมอ (เมื่ออยู่ใน control mode) — เป็นทางเข้าสู่ DIRECT
+    if (key == "MODE") {                          // 1=DIRECT, 0=AUTO — สลับได้แม้ AUTO schedule กำลังรัน
+        bleSetState(objects.mode, on);
+        if (objects.mode_label) lv_label_set_text(objects.mode_label, on ? "DIRECT" : "AUTO");
+        recheckupdata();   // invalidate cache → AUTO เริ่มตามตารางทันที / DIRECT หยุด schedule รอบถัดไป
+        return;
+    }
+
+    // actuator/speed/mute สั่งได้เฉพาะ DIRECT mode — AUTO = schedule คุม ห้าม BLE แทรก
+    // (กันบั๊ก: ไม่เปลี่ยนเป็น DIRECT ก่อน แต่สั่งติดชั่วขณะแล้ว schedule override กลับ)
+    bool directMode = objects.mode && lv_obj_has_state(objects.mode, LV_STATE_CHECKED);
+    if (!directMode) { Serial.printf("[BLE] ignored (not DIRECT): %s\n", cmd.c_str()); return; }
+
+    if      (key == "FAN")     { bleApplyRelay(objects.fan,     objects.panel_fan,     on); state_device(); }
+    else if (key == "LIGHT")   { bleApplyRelay(objects.light,   objects.panel_light,   on); state_device(); }
+    else if (key == "PUMP")    { bleApplyRelay(objects.pump,    objects.panel_pump,    on); state_device(); }
+    else if (key == "SPRAY")   { bleApplyRelay(objects.spray,   objects.panel_spray,   on); state_device(); }
+    else if (key == "RESERVE") { bleApplyRelay(objects.reserve, objects.panel_reserve, on); state_device(); }
+    else if (key == "SPEED")   {                  // 1=HIGH, 0=LOW — sync_state ไม่ครอบ ต้องยิงเอง
+        bleSetState(objects.speed, on);
+        if (objects.m_fan) lv_label_set_text(objects.m_fan, on ? "HIGH" : "LOW");
+        Serial2.println(on ? "FAN_HIGH" : "FAN_LOW");
+    }
+    else if (key == "MUTE")    {                  // valid เฉพาะตอน fan ON (mirror silen path)
+        bool fanOn = objects.fan && lv_obj_has_state(objects.fan, LV_STATE_CHECKED);
+        if (fanOn) {
+            silen      = on;
+            isMuteOpen = !silen;
+            warring    = isMuteOpen;
+            if (objects.sound_1) {
+                if (silen) lv_obj_add_state  (objects.sound_1, LV_STATE_CHECKED);
+                else       lv_obj_clear_state(objects.sound_1, LV_STATE_CHECKED);
+                lv_obj_invalidate(objects.sound_1);
+            }
+            Serial2.println(silen ? "Mute: CLOSE" : "Mute: OPEN");
+        }
+    }
+    else { Serial.printf("[BLE] unknown cmd: %s\n", cmd.c_str()); }
+}
+
+// status JSON (mirror sendSensorData fields + speed) — ส่งผ่าน TX notify
+static String bleBuildStatus() {
+    auto chk = [](lv_obj_t* o) -> int { return (o && lv_obj_has_state(o, LV_STATE_CHECKED)) ? 1 : 0; };
+    String j = "{";
+    j += "\"fan\":"     + String(chk(objects.fan))     + ",";
+    j += "\"light\":"   + String(chk(objects.light))   + ",";
+    j += "\"pump\":"    + String(chk(objects.pump))    + ",";
+    j += "\"spray\":"   + String(chk(objects.spray))   + ",";
+    j += "\"reserve\":" + String(chk(objects.reserve)) + ",";
+    j += "\"speed\":"   + String(chk(objects.speed))   + ",";
+    j += "\"mode\":"    + String(chk(objects.mode))    + ",";
+    j += "\"silen\":"   + String(silen ? 1 : 0)        + ",";
+    j += "\"windMs\":"  + String(smoothedWindMs, 2)    + ",";
+    j += "\"windFt\":"  + String(smoothedWindFt, 1)    + ",";
+    j += "\"alarm1\":"  + String(alarm_active[0] ? 1 : 0) + ",";
+    j += "\"alarm2\":"  + String(alarm_active[1] ? 1 : 0) + ",";
+    j += "\"alarm3\":"  + String(alarm_active[2] ? 1 : 0) + ",";
+    DateTime n = rtc.now();
+    char tb[24];
+    snprintf(tb, sizeof(tb), "%04d-%02d-%02d %02d:%02d:%02d",
+             n.year(), n.month(), n.day(), n.hour(), n.minute(), n.second());
+    j += "\"time\":\"" + String(tb) + "\",";
+    j += "\"ctrl\":"    + String(bleControlMode ? 1 : 0) + ",";
+    j += "\"buzz\":"    + String(buzz_mode);
+    j += "}";
+    return j;
+}
+static void bleNotify() {
+    if (!bleClientConnected || !bleTxChar) return;
+    String s = bleBuildStatus();
+    bleTxChar->setValue((uint8_t*)s.c_str(), s.length());
+    bleTxChar->notify();
+}
+
+void bleSetup() {
+    String name = String("FumHood-") + deviceId;
+    NimBLEDevice::init(name.c_str());
+    NimBLEDevice::setMTU(185);   // notify ยาวพอสำหรับ schedule slot JSON
+    NimBLEServer* server = NimBLEDevice::createServer();
+    server->setCallbacks(new BleServerCb());
+    NimBLEService* svc = server->createService(BLE_SVC_UUID);
+
+    // SECURITY (BUG #5): RX is open WRITE/WRITE_NR with no link-layer auth. Actuator
+    // commands (FAN/PUMP/...) are already gated behind CTRL/bleControlMode, but config
+    // writes (RTC/SCHED/CLEARALARM) are intentionally ungated so the web app's schedule
+    // editor / RTC sync work without entering control mode (see fumhood-web/app.js).
+    // Hardening to NIMBLE_PROPERTY::WRITE_ENC needs passkey bonding on BOTH firmware and
+    // the web/app clients — a coordinated cross-component change.
+    // TODO(security): add NimBLEDevice::setSecurityAuth(bond,mitm,sc) + passkey and switch
+    // RX to WRITE_ENC once the web/app support pairing.
+    NimBLECharacteristic* rx = svc->createCharacteristic(
+        BLE_RX_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
+    rx->setCallbacks(new BleRxCb());
+
+    // NimBLE สร้าง CCCD ให้อัตโนมัติ — ไม่ต้อง BLE2902
+    bleTxChar = svc->createCharacteristic(BLE_TX_UUID, NIMBLE_PROPERTY::NOTIFY);
+
+    svc->start();
+    NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+    adv->addServiceUUID(BLE_SVC_UUID);
+    adv->setName(name.c_str());
+    adv->enableScanResponse(true);
+    NimBLEDevice::startAdvertising();
+    Serial.printf("[BLE] advertising as %s\n", name.c_str());
+}
+
+// แตกหลายคำสั่งคั่น '\n' — ใช้ทั้ง BLE write และ HTTP /cmd
+static void bleHandleLines(const String& c) {
+    int start = 0;
+    while (start < (int)c.length()) {
+        int nl = c.indexOf('\n', start);
+        String line = (nl < 0) ? c.substring(start) : c.substring(start, nl);
+        bleHandleCommand(line);
+        if (nl < 0) break;
+        start = nl + 1;
+    }
+}
+
+void blePoll() {
+    if (bleCmdReady) {
+        char local[192];                          // snapshot under spinlock → parse outside critical section
+        portENTER_CRITICAL(&bleCmdMux);
+        strlcpy(local, bleCmdBuf, sizeof(local));
+        bleCmdReady = false;
+        portEXIT_CRITICAL(&bleCmdMux);
+        bleHandleLines(local);
+        bleNotify();                              // ตอบ status ทันทีหลังรับคำสั่ง
+    }
+    static unsigned long lastBleStatus = 0;       // push status เป็นจังหวะ ~1s
+    if (millis() - lastBleStatus >= 1000) {
+        lastBleStatus = millis();
+        bleNotify();
+    }
+    // ไร้คำสั่งจากมือถือ 30 นาที → ออกโหมดควบคุม + กลับ AUTO
+    if (bleControlMode && millis() - bleLastCmdTime >= 30UL * 60UL * 1000UL) {
+        bleControlMode = false;
+        bleRevertToAuto();
+        Serial.println("[BLE] no activity 30min -> exit ctrl, back to AUTO");
+        bleNotify();
+    }
+    static unsigned long lastMemLog = 0;          // heap watch: BLE+WiFi AP no-PSRAM ตึงแค่ไหน
+    if (millis() - lastMemLog >= 10000) {
+        lastMemLog = millis();
+        lv_mem_monitor_t m;
+        lv_mem_monitor(&m);                       // ดูว่า LVGL pool 64KB ใช้จริงเท่าไร (เผื่อตัดคืน heap)
+        Serial.printf("[MEM] free=%u min=%u lvgl_used=%u%% lvgl_free=%u\n",
+                      ESP.getFreeHeap(), ESP.getMinFreeHeap(), m.used_pct, (unsigned)m.free_size);
+    }
+}
+
+#if WIFI_GATEWAY
+// ===================== WiFi AP gateway (HTTP control) =====================
+// softAP "FumHood-<id>" → เว็บฝังในบอร์ดที่ http://192.168.4.1
+// reuse wifiServer(80) ของ provisioning portal (BLE_ONLY ไม่เข้า portal flow)
+static bool gwStarted = false;
+
+static String gwSchedJson(int d) {
+    if (d < 0 || d > 6) d = 0;
+    ProgramData p = loadProgram(d);
+    String j = "{\"d\":" + String(d) + ",\"slots\":[";
+    for (int s = 0; s < 6; s++) {
+        j += "[" + String(p.hour_start[s]) + "," + String(p.minute_start[s]) + ","
+           + String(p.hour_end[s])   + "," + String(p.minute_end[s])   + ","
+           + String(p.fan[s])   + "," + String(p.light[s]) + "," + String(p.pump[s]) + ","
+           + String(p.spray[s]) + "," + String(p.reserve[s]) + "," + String(p.state[s]) + "]";
+        if (s < 5) j += ",";
+    }
+    j += "]}";
+    return j;
+}
+
+// AP = provisioning portal เท่านั้น (ใส่รหัส WiFi บ้าน → save → restart เข้า cloud mode)
+// เปิดจากหน้า help ตอนยังไม่มี creds — ปิด BLE ชั่วคราวคืน heap
+static unsigned long gwLastClientSeen = 0;
+void handleWiFiPortal();   // forward (นิยามอยู่ส่วน provisioning เดิม)
+void handleWiFiSave();
+
+void gwStart() {
+    if (gwStarted) return;
+    if (cloudMode) mqtt.disconnect();
+    else NimBLEDevice::deinit(true);    // ปิด BLE คืน heap ให้ AP+HTTP
+    delay(50);
+    WiFi.useStaticBuffers(false);
+    WiFi.mode(WIFI_AP);
+    String ap = String("FumHood-") + deviceId;
+    WiFi.softAP(ap.c_str(), "fumhood1234", 1, 0, 2);
+    static bool routesRegistered = false;
+    if (!routesRegistered) {
+        routesRegistered = true;
+        wifiServer.on("/",     handleWiFiPortal);   // ฟอร์มใส่ SSID+รหัส WiFi บ้าน
+        wifiServer.on("/save", handleWiFiSave);     // save NVS → restart
+    }
+    wifiServer.begin();
+    gwStarted = true;
+    gwLastClientSeen = millis();
+    Serial.printf("[GW] provisioning AP %s @ %s heap=%u\n",
+                  ap.c_str(), WiFi.softAPIP().toString().c_str(), ESP.getFreeHeap());
+}
+
+void gwStop() {
+    if (!gwStarted) return;
+    wifiServer.stop();
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_OFF);
+    gwStarted = false;
+    delay(50);
+    if (cloudMode) connectToWiFi();     // กลับ STA+MQTT
+    else bleSetup();                    // กลับ BLE
+    Serial.printf("[GW] AP off heap=%u\n", ESP.getFreeHeap());
+}
+
+void gwPoll() {
+    if (!gwStarted) return;
+    wifiServer.handleClient();
+    if (WiFi.softAPgetStationNum() > 0) gwLastClientSeen = millis();
+    extern bool helpActive;
+    if (!helpActive && millis() - gwLastClientSeen > 60000) gwStop();
+}
+#endif // WIFI_GATEWAY
+
+// ===================== Help screen: วิธีเชื่อมต่อมือถือ (กด ESC ค้าง 3 วิ) =====================
+// 3 QR: (1) ต่อ WiFi AP อัตโนมัติ (2) เปิดเว็บ 192.168.4.1 (3) เว็บ vercel สำหรับ Android/BLE
+static lv_obj_t* helpScr = NULL;
+bool helpActive = false;
+
+static lv_obj_t* helpQr(lv_obj_t* parent, const char* data, int x) {
+    lv_obj_t* q = lv_qrcode_create(parent);
+    lv_qrcode_set_size(q, 120);
+    lv_qrcode_set_dark_color(q, lv_color_black());
+    lv_qrcode_set_light_color(q, lv_color_white());
+    lv_qrcode_update(q, data, strlen(data));
+    lv_obj_align(q, LV_ALIGN_TOP_MID, x, 52);
+    return q;
+}
+static lv_obj_t* helpLabel(lv_obj_t* parent, const char* txt, int x, int y, lv_color_t col) {
+    lv_obj_t* l = lv_label_create(parent);
+    lv_obj_set_style_text_font(l, &ui_font_thai_18, 0);
+    lv_obj_set_style_text_color(l, col, 0);
+    lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_text(l, txt);
+    lv_obj_align(l, LV_ALIGN_TOP_MID, x, y);
+    return l;
+}
+
+void helpScreenShow() {
+    if (helpScr) { lv_obj_del(helpScr); helpScr = NULL; }
+    helpScr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(helpScr, lv_color_white(), 0);
+
+    // QR เดียว → เว็บ + ?id ระบุเครื่องนี้ (Android เปิดเข้าแอป / iPhone เปิดใน Bluefy)
+    helpLabel(helpScr, "สแกนเพื่อเชื่อมต่อเครื่องนี้", 0, 8, lv_color_hex(0x0D47A1));
+    String url = String("https://fumhood-web.vercel.app/?id=") + deviceId;
+    lv_obj_t* q = lv_qrcode_create(helpScr);
+    lv_qrcode_set_size(q, 170);
+    lv_qrcode_set_dark_color(q, lv_color_black());
+    lv_qrcode_set_light_color(q, lv_color_white());
+    lv_qrcode_update(q, url.c_str(), url.length());
+    lv_obj_align(q, LV_ALIGN_TOP_MID, 0, 44);
+    helpLabel(helpScr, "Android: แอป FumHood\niPhone: เปิดในแอป Bluefy", 0, 224, lv_color_black());
+    String foot = String("เครื่อง: ") + deviceId + "  |  ESC = กลับ";
+    helpLabel(helpScr, foot.c_str(), 0, 288, lv_color_hex(0x5C6B7A));
+
+    lv_scr_load(helpScr);
+    helpActive = true;
+}
+void helpScreenExit() {
+    if (!helpActive) return;
+    helpActive = false;
+    lv_scr_load(objects.main);
+    lv_obj_invalidate(objects.main);
+    if (helpScr) { lv_obj_del(helpScr); helpScr = NULL; }   // free help screen + QR buffer กัน leak/fragment
+}
+// ESC (bt_8) ค้าง 3 วิ → เปิดหน้า help, กด ESC สั้นขณะเปิด → กลับ main
+void checkHelpButton() {
+    static unsigned long t0 = 0;
+    static bool held = false, fired = false;
+    if (digitalRead(bt_8) == HIGH) {
+        if (!held) { held = true; t0 = millis(); }
+        // ค้าง 3 วิ บนหน้าปกติ → เปิด help; fired เซ็ตเฉพาะตอน show จริง (กัน back-press ยาวไปเซ็ต fired)
+        if (!helpActive && !fired && millis() - t0 >= 3000) { fired = true; helpScreenShow(); }
+    } else {
+        // ปล่อย ESC ขณะ help เปิด (และไม่ใช่ release ของ hold ที่เพิ่งเปิด) = กลับ main
+        // exit ตอน release → btn_esc เป็น LOW แล้ว CT_mode จึงไม่ navigate ชน (กันจอค้าง)
+        if (held && helpActive && !fired) helpScreenExit();
+        held = false; fired = false;
+    }
+}
+#endif // BLE_ONLY
 bool isAutoClosing = false;     
 bool isAutoClosing_on = false; 
 bool autoLedState = LOW;       
@@ -2826,6 +3395,8 @@ void setup()
     tft.fillScreen(TFT_BLACK);
     loadAlertSetting();
     loadCalibration();
+    loadBuzzMode();                          // โหลด buzzer pattern จาก NVS
+    Serial2.print("BUZZ:"); Serial2.println(buzz_mode);   // sync ให้ Nano ตั้งแต่ boot
     Wire.begin(8, 9);
     for (int i = 0; i < numLeds; i++) {
     pinMode(leds[i], OUTPUT);
@@ -2866,9 +3437,14 @@ void setup()
     ui_init();
     Serial.println("Setup Done");
 
-    // ---- Device ID + WiFi ----
+    // ---- Device ID + WiFi/BLE ----
     initDeviceId();
+#if BLE_ONLY
+    WiFi.mode(WIFI_OFF);   // BLE เท่านั้น — RAM โล่ง ไม่มี WiFi/cloud
+    bleSetup();
+#else
     connectToWiFi();
+#endif
     // --------------------------
 
     sr.setAllHigh();
@@ -2978,10 +3554,24 @@ void loop(){
     checkLongPress();
     checkResetButton();
      if (!isSystemOn){checkLongPress_time();}
-    if (!isSystemOn && !isTime) { 
-        vTaskDelay(10); 
+#if BLE_ONLY
+    blePoll();   // service BLE ทุกสถานะ — คุมผ่านเว็บได้แม้เครื่องปิด (ก่อน early-return)
+#if WIFI_GATEWAY
+    gwPoll();    // HTTP gateway ก็ต้องวิ่งทุกสถานะเช่นกัน
+#endif
+#endif
+    if (!isSystemOn && !isTime) {
+        vTaskDelay(10);
         return;
     }
+#if BLE_ONLY
+    checkHelpButton();   // ESC ค้าง 3 วิ → หน้าวิธีเชื่อมต่อ (QR)
+    if (helpActive) {    // help = modal: render LVGL อย่างเดียว กัน ESC ชน CT_mode nav (จอค้าง)
+        if (!lvglPaused && millis() - lastLVGL >= 5) { lastLVGL = millis(); lv_timer_handler(); }
+        vTaskDelay(5);
+        return;
+    }
+#endif
     led_add_state();
     handle_mute_button();
     handleShortPressTask();
@@ -3007,8 +3597,10 @@ void loop(){
         lastRTC = millis();
         timer();
         // [APP CONTROL] เรียกทุกหน้า เพื่อให้รับ/ส่งคำสั่ง appControlMode ได้แม้ไม่ได้อยู่หน้า MAIN
+#if !BLE_ONLY
         readFirebaseCommands();
-        
+#endif
+
         if (CUR_SCREEN == objects.main) {
             if (!isOnMainScreen) {
                 isOnMainScreen = true;
@@ -3048,6 +3640,7 @@ void loop(){
         lastLVGL = millis();
         lv_timer_handler();
     }
+#if !BLE_ONLY
     // ---- WiFi auto-reconnect (non-blocking) + one-shot connected hook ----
     static unsigned long lastWiFiCheck = 0;
     if (millis() - lastWiFiCheck > 10000) {
@@ -3066,6 +3659,7 @@ void loop(){
     }
     sendSensorData();
     // readFirebaseCommands(); ← ย้ายไปอยู่ด้านบนก่อน checkAndRunSchedule แล้ว
+#endif
     // ------------------
     vTaskDelay(1);
 }
@@ -3155,6 +3749,9 @@ void wakeUpScreen() {
   }
     tft.setTextDatum(top_left);
     lv_scr_load_anim(objects.main, LV_SCR_LOAD_ANIM_NONE, 0, 0, false);
+    // [FIX] power-cycle: main เป็น active อยู่แล้ว → lv_scr_load_anim ไม่ invalidate เต็มจอ
+    // → redraw บางส่วน widget หาย. บังคับ invalidate ทั้งจอ + ทับ direct-TFT ที่วาดไว้ก่อนหน้า
+    lv_obj_invalidate(objects.main);
     lv_obj_clear_state(objects.sound_1, LV_STATE_CHECKED);
     counter = 0;
 }
@@ -3385,9 +3982,8 @@ void handleWiFiSave() {
     wifiPrefs.putString("pass", password);
     wifiPrefs.end();
     
-    delay(500);
     Serial.printf("[WiFi] Credentials saved: %s\n", ssid.c_str());
-    delay(2000);
+    delay(200);   // brief settle so the HTTP response flushes before reboot (was delay(500)+delay(2000))
     ESP.restart();
   } else {
     wifiServer.send(400, "text/plain", "Error");
@@ -3521,11 +4117,15 @@ void enterWiFiProvisioningMode() {
 }
 
 void checkResetButton() {
+#if BLE_ONLY
+  // BLE_ONLY: ไม่ใช้ WiFi Provisioning — ESC ค้าง 3 วิ เป็นหน้า help/QR (checkHelpButton) แทน
+  return;
+#endif
   static unsigned long esc_start_time = 0;
   static bool is_esc_pressing = false;
   static bool prov_mode_triggered = false;
 
-  if (btn_esc == HIGH) { 
+  if (btn_esc == HIGH) {
     if (!is_esc_pressing) {
       is_esc_pressing = true;
       esc_start_time = millis();
@@ -3538,7 +4138,7 @@ void checkResetButton() {
       Serial.println("[ESC] WiFi Provisioning Mode Triggered");
       enterWiFiProvisioningMode();
     }
-    
+
   } else {
     is_esc_pressing = false;
     prov_mode_triggered = false;

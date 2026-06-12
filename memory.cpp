@@ -181,9 +181,34 @@ float alert_set;
 void loadAlertSetting() {
     if (prefs.begin("settings", true)) {
         // อ่านค่า alert_val ถ้าไม่มีให้ใช้ค่า Default เป็น 0.50
-        alert_set = prefs.getFloat("alert_val", 1.0); 
+        alert_set = prefs.getFloat("alert_val", 1.0);
         prefs.end();
         Serial2.printf("[System] Alert Loaded: %.2f\n", alert_set);
+    }
+}
+
+int buzz_mode = 1;   // default = กระพริบช้า 500ms
+
+// บันทึก buzzer pattern (ตั้งผ่านเว็บ → จำใน NVS)
+void saveBuzzMode(int mode) {
+    if (mode < 0) mode = 0;
+    if (mode > 3) mode = 3;
+    buzz_mode = mode;
+    if (prefs.begin("settings", false)) {   // ใช้ namespace "settings" ร่วมกับ alert_val
+        prefs.putInt("buzz_mode", buzz_mode);
+        prefs.end();
+        Serial2.printf("[System] Buzz Mode Saved: %d\n", buzz_mode);
+    } else {
+        Serial2.println("[Error] Cannot open NVS for buzz_mode");
+    }
+}
+
+// โหลด buzzer pattern (เรียกใน setup)
+void loadBuzzMode() {
+    if (prefs.begin("settings", true)) {
+        buzz_mode = prefs.getInt("buzz_mode", 1);   // default = 1 (ช้า)
+        prefs.end();
+        Serial2.printf("[System] Buzz Mode Loaded: %d\n", buzz_mode);
     }
 }
 
@@ -218,10 +243,12 @@ void createMockProgramData() {
 }
 
 void systemFirstBootCheck() {
+    // อ่านสถานะ "is_ready" ในบล็อกของตัวเอง แล้วปิดทันที
+    // (เพราะ helper ด้านล่างเรียก prefs.begin/end กับ namespace อื่นบน prefs ตัวเดียวกัน)
     prefs.begin("system", false);
-    
     // ตรวจสอบคีย์ "is_ready" ถ้าไม่มีค่า (พึ่งเปิดครั้งแรก) จะได้ false
     bool isReady = prefs.getBool("is_ready", false);
+    prefs.end();
 
     if (!isReady) {
         Serial.println(">>> FIRST BOOT DETECTED! Initializing NVS...");
@@ -236,12 +263,13 @@ void systemFirstBootCheck() {
         // 3. ตั้งค่า Alert เริ่มต้น
         saveAlertSetting(1.0);
 
-        // 4. บันทึกสถานะว่าระบบพร้อมแล้ว
+        // 4. บันทึกสถานะว่าระบบพร้อมแล้ว ในบล็อกใหม่ของตัวเอง
+        //    (helper ด้านบนปิด prefs ไปแล้ว ต้อง begin ใหม่ ไม่งั้นการเขียนจะถูกปฏิเสธเงียบๆ)
+        prefs.begin("system", false);
         prefs.putBool("is_ready", true);
+        prefs.end();
         Serial.println(">>> NVS INITIALIZATION COMPLETE!");
     } else {
         Serial.println("[System] NVS already contains data. Ready to go.");
     }
-    
-    prefs.end();
 }

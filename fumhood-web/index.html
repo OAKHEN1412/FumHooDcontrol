@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8" />
+  <!-- SECURITY: restrict where code/styles/data may come from. The QR scanner is
+       loaded from unpkg (see loadScript in app.js); pin its origin here. style-src
+       keeps 'unsafe-inline' because the markup uses inline style="" attributes.
+       TODO(security): once SRI is added in app.js, this remains defense-in-depth. -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self';
+                 script-src 'self' https://unpkg.com;
+                 style-src 'self' 'unsafe-inline';
+                 img-src 'self' data: blob:;
+                 media-src 'self' blob:;
+                 connect-src 'self';
+                 manifest-src 'self';
+                 object-src 'none';
+                 base-uri 'self';
+                 frame-ancestors 'none'" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="theme-color" content="#1976D2" />
+  <title>FumHood — BLE Control</title>
+  <link rel="manifest" href="manifest.json" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="appbar">
+    <div class="appbar-title">FumHood</div>
+    <div id="conn-pill" class="pill pill-off">ไม่ได้เชื่อมต่อ</div>
+  </header>
+
+  <main class="container">
+
+    <!-- Connect (global) -->
+    <section class="card">
+      <button id="btn-connect" class="btn btn-primary btn-block">เชื่อมต่อ Bluetooth</button>
+      <button id="btn-scan" class="btn btn-ghost btn-block" style="margin-top:8px">📷 สแกน QR ที่ตัวเครื่อง</button>
+      <div id="qr-reader" class="hidden" style="margin-top:10px;border-radius:12px;overflow:hidden"></div>
+      <button id="btn-disconnect" class="btn btn-ghost btn-block hidden">ตัดการเชื่อมต่อ</button>
+      <div id="device-name" class="muted small center hidden"></div>
+      <div id="unsupported" class="banner banner-warn hidden">
+        เบราว์เซอร์นี้ไม่รองรับ Web Bluetooth — Android ใช้ Chrome/Edge,
+        iPhone เปิดผ่านแอป <b>Bluefy</b> (ฟรีใน App Store)
+      </div>
+      <div class="muted small center" style="margin-top:6px">
+        iPhone: ใช้แอป <a href="https://apps.apple.com/app/bluefy-web-ble-browser/id1492822055" target="_blank"><b>Bluefy</b></a> เปิดเว็บนี้
+      </div>
+    </section>
+
+    <!-- ========== DASHBOARD VIEW ========== -->
+    <div id="view-dashboard">
+      <section class="card row-toggle" id="ctrl-card">
+        <div class="row-main">
+          <div class="row-icon">🎛️</div>
+          <div>
+            <div class="row-label">โหมดควบคุมผ่านแอป</div>
+            <div class="muted small">ต้องเปิดก่อนสั่งงานปุ่มอื่น</div>
+          </div>
+        </div>
+        <label class="switch"><input type="checkbox" id="sw-ctrl" /><span class="slider"></span></label>
+      </section>
+
+      <section class="card seg" id="mode-card">
+        <div class="seg-label">โหมด</div>
+        <div class="seg-btns">
+          <button class="seg-btn" data-mode="auto" id="mode-auto">AUTO</button>
+          <button class="seg-btn" data-mode="direct" id="mode-direct">DIRECT</button>
+        </div>
+      </section>
+
+      <section id="alarm-banner" class="banner banner-alarm hidden" role="button">
+        ⚠️ มีการแจ้งเตือน — แตะเพื่อเคลียร์
+      </section>
+
+      <section class="sensor-grid">
+        <div class="sensor-card"><div class="sensor-val" id="wind-ms">--</div><div class="sensor-unit">m/s</div></div>
+        <div class="sensor-card"><div class="sensor-val" id="wind-ft">--</div><div class="sensor-unit">ft/min</div></div>
+      </section>
+
+
+      <section class="card row-toggle" id="mute-card">
+        <div class="row-main">
+          <div class="row-icon">🔕</div>
+          <div>
+            <div class="row-label">ปิดเสียง (Mute)</div>
+            <div class="muted small">ใช้ได้เมื่อพัดลมเปิด</div>
+          </div>
+        </div>
+        <label class="switch"><input type="checkbox" id="sw-mute" /><span class="slider slider-purple"></span></label>
+      </section>
+
+      <section class="card seg" id="buzz-card">
+        <div class="seg-label">เสียงแจ้งเตือน (Buzzer)</div>
+        <div class="seg-btns">
+          <button class="seg-btn" data-buzz="0" id="buzz-0">ต่อเนื่อง</button>
+          <button class="seg-btn" data-buzz="1" id="buzz-1">ช้า</button>
+          <button class="seg-btn" data-buzz="2" id="buzz-2">เร็ว</button>
+          <button class="seg-btn" data-buzz="3" id="buzz-3">บี๊บคู่</button>
+        </div>
+      </section>
+
+      <section class="card-group" id="relay-group"></section>
+
+      <section class="card seg" id="speed-card">
+        <div class="seg-label">ความเร็วพัดลม</div>
+        <div class="seg-btns">
+          <button class="seg-btn" data-speed="low" id="speed-low">LOW</button>
+          <button class="seg-btn" data-speed="high" id="speed-high">HIGH</button>
+        </div>
+      </section>
+
+      <section class="alarm-grid">
+        <div class="alarm-chip" id="alarm1"><span>Alarm 1</span><b>OK</b></div>
+        <div class="alarm-chip" id="alarm2"><span>Alarm 2</span><b>OK</b></div>
+        <div class="alarm-chip" id="alarm3"><span>Alarm 3</span><b>OK</b></div>
+      </section>
+
+      <!-- RTC: ย่อเก็บมุมล่าง ใช้ไม่บ่อย -->
+      <details class="card rtc-collapse" id="rtc-card">
+        <summary>
+          <span class="row-icon">🕐</span>
+          <span class="rtc-sum-txt"><span class="row-label">เวลาเครื่อง</span> · <span class="muted small" id="rtc-now">--</span></span>
+          <span class="chev">▾</span>
+        </summary>
+        <button id="btn-rtc-sync" class="btn btn-primary btn-block" style="margin-top:12px">ตั้งเป็นเวลาปัจจุบันของมือถือ</button>
+      </details>
+    </div>
+
+    <!-- ========== SCHEDULE VIEW ========== -->
+    <div id="view-schedule" class="hidden">
+      <section class="card">
+        <div class="seg-label" style="margin-bottom:10px">ตารางเวลา (บันทึกลงเครื่อง · NVS)</div>
+        <div class="day-tabs" id="day-tabs"></div>
+      </section>
+      <div id="slot-list" class="card-group"></div>
+      <div class="muted small center" style="margin-top:4px">
+        แต่ละวันมี 6 ช่วงเวลา · เปิดสวิตช์ช่วงเพื่อให้ทำงาน · กด “บันทึก” เพื่อเขียนลงเครื่อง
+      </div>
+    </div>
+
+    <footer class="foot muted small center">
+      iPhone: เปิดหน้านี้ด้วยแอป <b>Bluefy</b> เท่านั้น (Safari/Chrome บน iOS ใช้ Bluetooth ไม่ได้)
+    </footer>
+  </main>
+
+  <nav class="bottomnav">
+    <button class="nav-btn active" id="nav-dashboard"><span>🎚️</span>ควบคุม</button>
+    <button class="nav-btn" id="nav-schedule"><span>🗓️</span>ตารางเวลา</button>
+  </nav>
+
+  <div id="toast" class="toast hidden"></div>
+  <script src="app.js"></script>
+</body>
+</html>

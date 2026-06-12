@@ -24,3 +24,6 @@ build.options.json
 flash_args
 partitions.csv
 sdkconfig
+
+# Vercel
+.vercel/

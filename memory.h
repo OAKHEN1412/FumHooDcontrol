@@ -12,6 +12,7 @@ extern Preferences prefs;
 extern float rLow, rHigh;
 extern float nLow, nHigh;
 extern float alert_set;
+extern int buzz_mode;   // buzzer alert pattern 0..3 (0=ต่อเนื่อง 1=ช้า 2=เร็ว 3=บี๊บคู่)
 
 // ==========================================
 // โครงสร้างข้อมูลการตั้งเวลา
@@ -58,5 +59,9 @@ void loadCalibration();
 // การจัดการ Alert
 void saveAlertSetting(float value);
 void loadAlertSetting();
+
+// การจัดการ Buzzer pattern
+void saveBuzzMode(int mode);
+void loadBuzzMode();
 
 #endif
