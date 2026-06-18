@@ -14,6 +14,7 @@ extern float nLow, nHigh;
 extern float alert_set;
 extern int buzz_mode;   // buzzer alert pattern 0..3 (0=ต่อเนื่อง 1=ช้า 2=เร็ว 3=บี๊บคู่)
 extern int ext_buzz;    // external sounder on relay pin7 — 0=off 1=on
+extern int sensor_unit; // wind display unit: 0=ms (default) 1=ft
 
 // ==========================================
 // โครงสร้างข้อมูลการตั้งเวลา
@@ -68,5 +69,9 @@ void loadBuzzMode();
 // การจัดการ Buzzer ภายนอก (relay pin7)
 void saveExtBuzz(int on);
 void loadExtBuzz();
+
+// การจัดการหน่วยแสดงผลเซ็นเซอร์ (ms/ft) — ตั้งผ่านเว็บ จำใน NVS
+void saveSensorUnit(int unit);
+void loadSensorUnit();
 
 #endif

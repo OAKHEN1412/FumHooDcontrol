@@ -3,9 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <!-- SECURITY: restrict where code/styles/data may come from. The QR scanner is
-       loaded from unpkg (see loadScript in app.js); pin its origin here. style-src
-       keeps 'unsafe-inline' because the markup uses inline style="" attributes.
-       TODO(security): once SRI is added in app.js, this remains defense-in-depth. -->
+       loaded from unpkg (see loadScript in app.js); pin its origin here. -->
   <meta http-equiv="Content-Security-Policy"
         content="default-src 'self';
                  script-src 'self' https://unpkg.com;
@@ -18,37 +16,46 @@
                  base-uri 'self';
                  frame-ancestors 'none'" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-  <meta name="theme-color" content="#1976D2" />
+  <meta name="theme-color" content="#0f766e" />
   <title>FumHood — BLE Control</title>
   <link rel="manifest" href="manifest.json" />
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
   <header class="appbar">
-    <div class="appbar-title">FumHood</div>
-    <div id="conn-pill" class="pill pill-off">ไม่ได้เชื่อมต่อ</div>
+    <div class="appbar-brand"><span class="appbar-logo">🌬️</span><span>FumHood</span></div>
+    <div id="conn-pill" class="pill pill-off"><span class="dot"></span>ไม่ได้เชื่อมต่อ</div>
   </header>
 
   <main class="container">
 
     <!-- Connect (global) -->
-    <section class="card">
-      <button id="btn-connect" class="btn btn-primary btn-block">เชื่อมต่อ Bluetooth</button>
-      <button id="btn-scan" class="btn btn-ghost btn-block" style="margin-top:8px">📷 สแกน QR ที่ตัวเครื่อง</button>
-      <div id="qr-reader" class="hidden" style="margin-top:10px;border-radius:12px;overflow:hidden"></div>
+    <section class="card connect-card" id="connect-card">
+      <button id="btn-connect" class="btn btn-primary btn-block">🔗 เชื่อมต่อ Bluetooth</button>
+      <button id="btn-scan" class="btn btn-ghost btn-block">📷 สแกน QR ที่ตัวเครื่อง</button>
+      <div id="qr-reader" class="qr-reader hidden"></div>
       <button id="btn-disconnect" class="btn btn-ghost btn-block hidden">ตัดการเชื่อมต่อ</button>
       <div id="device-name" class="muted small center hidden"></div>
       <div id="unsupported" class="banner banner-warn hidden">
         เบราว์เซอร์นี้ไม่รองรับ Web Bluetooth — Android ใช้ Chrome/Edge,
         iPhone เปิดผ่านแอป <b>Bluefy</b> (ฟรีใน App Store)
       </div>
-      <div class="muted small center" style="margin-top:6px">
-        iPhone: ใช้แอป <a href="https://apps.apple.com/app/bluefy-web-ble-browser/id1492822055" target="_blank"><b>Bluefy</b></a> เปิดเว็บนี้
-      </div>
     </section>
 
     <!-- ========== DASHBOARD VIEW ========== -->
     <div id="view-dashboard">
+
+      <!-- sensor hero -->
+      <section class="hero">
+        <div class="hero-val"><span id="wind-ms">--</span><small>m/s</small></div>
+        <div class="hero-sep"></div>
+        <div class="hero-val"><span id="wind-ft">--</span><small>ft/min</small></div>
+      </section>
+
+      <section id="alarm-banner" class="banner banner-alarm hidden" role="button">
+        ⚠️ มีการแจ้งเตือน — แตะเพื่อเคลียร์
+      </section>
+
       <section class="card row-toggle" id="ctrl-card">
         <div class="row-main">
           <div class="row-icon">🎛️</div>
@@ -68,15 +75,15 @@
         </div>
       </section>
 
-      <section id="alarm-banner" class="banner banner-alarm hidden" role="button">
-        ⚠️ มีการแจ้งเตือน — แตะเพื่อเคลียร์
-      </section>
+      <section class="card-group" id="relay-group"></section>
 
-      <section class="sensor-grid">
-        <div class="sensor-card"><div class="sensor-val" id="wind-ms">--</div><div class="sensor-unit">m/s</div></div>
-        <div class="sensor-card"><div class="sensor-val" id="wind-ft">--</div><div class="sensor-unit">ft/min</div></div>
+      <section class="card seg" id="speed-card">
+        <div class="seg-label">ความเร็วพัดลม</div>
+        <div class="seg-btns">
+          <button class="seg-btn" data-speed="low" id="speed-low">LOW</button>
+          <button class="seg-btn" data-speed="high" id="speed-high">HIGH</button>
+        </div>
       </section>
-
 
       <section class="card row-toggle" id="mute-card">
         <div class="row-main">
@@ -89,9 +96,46 @@
         <label class="switch"><input type="checkbox" id="sw-mute" /><span class="slider slider-purple"></span></label>
       </section>
 
+      <section class="alarm-grid">
+        <div class="alarm-chip" id="alarm1"><span>Alarm 1</span><b>OK</b></div>
+        <div class="alarm-chip" id="alarm2"><span>Alarm 2</span><b>OK</b></div>
+        <div class="alarm-chip" id="alarm3"><span>Alarm 3</span><b>OK</b></div>
+      </section>
+
+      <details class="card rtc-collapse" id="rtc-card">
+        <summary>
+          <span class="row-icon">🕐</span>
+          <span class="rtc-sum-txt"><span class="row-label">เวลาเครื่อง</span> · <span class="muted small" id="rtc-now">--</span></span>
+          <span class="chev">▾</span>
+        </summary>
+        <button id="btn-rtc-sync" class="btn btn-primary btn-block">ตั้งเป็นเวลาปัจจุบันของมือถือ</button>
+      </details>
+    </div>
+
+    <!-- ========== SENSOR SETTINGS VIEW ========== -->
+    <div id="view-sensor" class="hidden">
+
+      <section class="card seg" id="unit-card">
+        <div class="seg-label">หน่วยแสดงผล</div>
+        <div class="seg-btns">
+          <button class="seg-btn" data-unit="ms" id="unit-ms">m/s</button>
+          <button class="seg-btn" data-unit="ft" id="unit-ft">ft/min</button>
+        </div>
+      </section>
+
+      <section class="card" id="alert-card">
+        <div class="seg-label" style="margin-bottom:10px">ค่าลมต่ำสุดที่เตือน (Alert)</div>
+        <div class="field-row">
+          <input type="number" id="alert-input" step="0.1" min="0" inputmode="decimal" placeholder="เช่น 1.0" />
+          <span class="field-unit">m/s</span>
+          <button id="btn-alert-save" class="btn btn-primary">บันทึก</button>
+        </div>
+        <div class="muted small" style="margin-top:8px">ลมต่ำกว่าค่านี้ → เตือน (LED แดง + buzzer)</div>
+      </section>
+
       <section class="card seg" id="buzz-card">
         <div class="seg-label">เสียงแจ้งเตือน (Buzzer)</div>
-        <div class="seg-btns">
+        <div class="seg-btns seg-btns-wrap">
           <button class="seg-btn" data-buzz="0" id="buzz-0">ต่อเนื่อง</button>
           <button class="seg-btn" data-buzz="1" id="buzz-1">ช้า</button>
           <button class="seg-btn" data-buzz="2" id="buzz-2">เร็ว</button>
@@ -110,31 +154,29 @@
         <label class="switch"><input type="checkbox" id="sw-extbuzz" /><span class="slider"></span></label>
       </section>
 
-      <section class="card-group" id="relay-group"></section>
-
-      <section class="card seg" id="speed-card">
-        <div class="seg-label">ความเร็วพัดลม</div>
-        <div class="seg-btns">
-          <button class="seg-btn" data-speed="low" id="speed-low">LOW</button>
-          <button class="seg-btn" data-speed="high" id="speed-high">HIGH</button>
+      <!-- calibration -->
+      <section class="card" id="cal-card">
+        <div class="seg-label">ปรับเทียบเซ็นเซอร์ลม (Calibration)</div>
+        <div class="cal-live">
+          <div class="cal-live-label">ค่าดิบปัจจุบัน</div>
+          <div class="cal-live-val"><span id="cal-raw">--</span><small>m/s</small></div>
+        </div>
+        <div id="cal-hint" class="banner banner-warn">
+          ต้องเข้าโหมดควบคุม + DIRECT + เปิดพัดลม แล้วรอ warm-up ก่อนจึงปรับเทียบได้
+        </div>
+        <div class="cal-step">
+          <div class="cal-step-txt"><b>1. จุดศูนย์</b> — ปิดลม/ไม่มีลม แล้วกด</div>
+          <button id="btn-cal-zero" class="btn btn-ghost" disabled>ตั้งจุดศูนย์</button>
+        </div>
+        <div class="cal-step">
+          <div class="cal-step-txt"><b>2. จุดสูง</b> — เป่าลมที่รู้ค่า กรอกค่าจริง แล้วกด</div>
+          <div class="field-row">
+            <input type="number" id="cal-high-ref" step="0.1" min="0" inputmode="decimal" placeholder="ค่าลมจริง" />
+            <span class="field-unit">m/s</span>
+            <button id="btn-cal-high" class="btn btn-primary" disabled>ตั้งจุดสูง</button>
+          </div>
         </div>
       </section>
-
-      <section class="alarm-grid">
-        <div class="alarm-chip" id="alarm1"><span>Alarm 1</span><b>OK</b></div>
-        <div class="alarm-chip" id="alarm2"><span>Alarm 2</span><b>OK</b></div>
-        <div class="alarm-chip" id="alarm3"><span>Alarm 3</span><b>OK</b></div>
-      </section>
-
-      <!-- RTC: ย่อเก็บมุมล่าง ใช้ไม่บ่อย -->
-      <details class="card rtc-collapse" id="rtc-card">
-        <summary>
-          <span class="row-icon">🕐</span>
-          <span class="rtc-sum-txt"><span class="row-label">เวลาเครื่อง</span> · <span class="muted small" id="rtc-now">--</span></span>
-          <span class="chev">▾</span>
-        </summary>
-        <button id="btn-rtc-sync" class="btn btn-primary btn-block" style="margin-top:12px">ตั้งเป็นเวลาปัจจุบันของมือถือ</button>
-      </details>
     </div>
 
     <!-- ========== SCHEDULE VIEW ========== -->
@@ -156,6 +198,7 @@
 
   <nav class="bottomnav">
     <button class="nav-btn active" id="nav-dashboard"><span>🎚️</span>ควบคุม</button>
+    <button class="nav-btn" id="nav-sensor"><span>📡</span>เซ็นเซอร์</button>
     <button class="nav-btn" id="nav-schedule"><span>🗓️</span>ตารางเวลา</button>
   </nav>
 

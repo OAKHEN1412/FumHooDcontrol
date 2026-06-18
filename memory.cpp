@@ -235,6 +235,29 @@ void loadExtBuzz() {
     }
 }
 
+int sensor_unit = 0;   // 0=ms (default) 1=ft
+
+// บันทึกหน่วยแสดงผลเซ็นเซอร์ (ตั้งผ่านเว็บ → จำใน NVS)
+void saveSensorUnit(int unit) {
+    sensor_unit = (unit == 1) ? 1 : 0;
+    if (prefs.begin("settings", false)) {
+        prefs.putInt("sensor_unit", sensor_unit);
+        prefs.end();
+        Serial2.printf("[System] Sensor Unit Saved: %d\n", sensor_unit);
+    } else {
+        Serial2.println("[Error] Cannot open NVS for sensor_unit");
+    }
+}
+
+// โหลดหน่วยแสดงผลเซ็นเซอร์ (เรียกใน setup)
+void loadSensorUnit() {
+    if (prefs.begin("settings", true)) {
+        sensor_unit = prefs.getInt("sensor_unit", 0);   // default = 0 (ms)
+        prefs.end();
+        Serial2.printf("[System] Sensor Unit Loaded: %d\n", sensor_unit);
+    }
+}
+
 void createMockProgramData() {
     Serial.println("[NVS] Generating Mock Data for 7 Days...");
 
