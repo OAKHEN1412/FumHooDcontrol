@@ -13,6 +13,7 @@ extern float rLow, rHigh;
 extern float nLow, nHigh;
 extern float alert_set;
 extern int buzz_mode;   // buzzer alert pattern 0..3 (0=ต่อเนื่อง 1=ช้า 2=เร็ว 3=บี๊บคู่)
+extern int ext_buzz;    // external sounder on relay pin7 — 0=off 1=on
 
 // ==========================================
 // โครงสร้างข้อมูลการตั้งเวลา
@@ -63,5 +64,9 @@ void loadAlertSetting();
 // การจัดการ Buzzer pattern
 void saveBuzzMode(int mode);
 void loadBuzzMode();
+
+// การจัดการ Buzzer ภายนอก (relay pin7)
+void saveExtBuzz(int on);
+void loadExtBuzz();
 
 #endif

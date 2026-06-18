@@ -1,5 +1,5 @@
 // Minimal offline cache for the FumHood BLE web app (shell only).
-const CACHE = 'fumhood-ble-v4';
+const CACHE = 'fumhood-ble-v6';
 const ASSETS = ['./', './index.html', './style.css', './app.js', './manifest.json'];
 
 self.addEventListener('install', (e) => {

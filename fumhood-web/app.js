@@ -75,10 +75,11 @@ function bleSupported() {
 async function connect() {
   if (!bleSupported()) { $('unsupported').classList.remove('hidden'); return; }
   try {
-    // มี id (สแกน QR มา) → filter ชื่อตรงตัว, ไม่มี → โชว์ทุกเครื่อง FumHood-*
+    // filter ด้วย service UUID เสมอ (เครื่อง advertise UUID นี้แน่นอน — ชื่ออาจตกไป scan
+    // response แล้วบาง host มองไม่เห็น). คง name filter ไว้เป็นตัวเลือกเสริม (OR กัน) เผื่อชื่อมา.
     const filters = DEVICE_ID
-      ? [{ name: `FumHood-${DEVICE_ID}` }]
-      : [{ namePrefix: 'FumHood-' }];
+      ? [{ name: `FumHood-${DEVICE_ID}` }, { services: [SVC_UUID] }]
+      : [{ namePrefix: 'FumHood-' }, { services: [SVC_UUID] }];
     device = await navigator.bluetooth.requestDevice({
       filters,
       optionalServices: [SVC_UUID],
@@ -228,14 +229,20 @@ function render() {
   for (let b = 0; b <= 3; b++) { const el = $(`buzz-${b}`); if (el) el.classList.toggle('active', b === buzz); }
   gate('buzz-card', true);
 
+  // external sounder (relay pin7) — setting, ไม่ผูก ctrl/direct
+  setChecked('sw-extbuzz', status.extbuzz === 1);
+  gate('extbuzz-card', true);
+
   // mute — ใช้ได้เฉพาะตอน fan on
   setChecked('sw-mute', status.silen === 1);
   const fanOn = status.fan === 1;
   $('sw-mute').disabled = !ctrl || !fanOn;
 
   // sensors
-  if (typeof status.windMs === 'number') $('wind-ms').textContent = status.windMs.toFixed(2);
-  if (typeof status.windFt === 'number') $('wind-ft').textContent = status.windFt.toFixed(0);
+  if (typeof status.windMs === 'number') {
+    $('wind-ms').textContent = status.windMs.toFixed(2);
+    $('wind-ft').textContent = (status.windMs * 196.8504).toFixed(0);   // device ไม่ส่ง windFt แล้ว (กัน JSON เกิน MTU)
+  }
 
   // device RTC time
   if (status.time) $('rtc-now').textContent = status.time;
@@ -260,7 +267,7 @@ function setConnUI(on) {
     $('device-name').classList.add('hidden');
     // reset visuals
     status = {}; render();
-    ['mode-card', 'mute-card', 'relay-group', 'speed-card', 'buzz-card'].forEach((id) => $(id).classList.add('gated'));
+    ['mode-card', 'mute-card', 'relay-group', 'speed-card', 'buzz-card', 'extbuzz-card'].forEach((id) => $(id).classList.add('gated'));
   }
 }
 
@@ -375,6 +382,7 @@ function init() {
   for (let b = 0; b <= 3; b++) {
     const el = $(`buzz-${b}`); if (el) el.addEventListener('click', () => sendCmd(`BUZZ:${b}`));
   }
+  $('sw-extbuzz').addEventListener('change', (e) => sendCmd(`EXTBUZZ:${e.target.checked ? 1 : 0}`));
   $('alarm-banner').addEventListener('click', () => { sendCmd('CLEARALARM'); toast('เคลียร์การแจ้งเตือน'); });
   $('btn-rtc-sync').addEventListener('click', syncRtc);
 

@@ -25,10 +25,36 @@ bool alarm1_triggered = false;
 bool alarm2_triggered = false;
 bool alarm3_triggered = false;
 
-// buzzer (pin7) alert pattern — set by S3 via "BUZZ:n", default slow blink
+// Buzzer (PASSIVE) on D12, driven with tone() so it actually sounds.
+// pin7 = RELAY contact for an EXTERNAL sounder. When enabled (extBuzz), the relay
+// MIRRORS the D12 buzzer pattern on/off (it can't carry tone(), only the on/off
+// envelope). Enabled/disabled from the web via BLE ("EXTBUZZ:0/1"), stored in S3 NVS.
+#define BUZZ_PIN  12   // passive buzzer (tone)
+#define RELAY_PIN 7    // relay for external sounder (digitalWrite on/off)
+
+bool extBuzz = false;  // external sounder enable — synced from S3 ("EXTBUZZ:n"), NVS-backed on S3
+
+// buzzer alert pattern — set by S3 via "BUZZ:n", default slow blink
 //   0 = ต่อเนื่อง (continuous ON)   1 = กระพริบช้า 500ms   2 = กระพริบเร็ว 150ms   3 = บี๊บคู่
 int buzzMode = 1;
 int buzzPhase = 0;   // double-beep state
+
+// Manual buzzer test from S3/serial: "TESTBUZZ:n" forces pattern n regardless of
+// the alarm inputs; "TESTBUZZ:off" stops it. Lets the buzzer be bench-tested.
+bool testAlarm = false;
+
+// Buzzer drive frequency (Hz). Tune to the passive buzzer's resonant freq for max
+// loudness (commonly ~2000-2700Hz).
+#define BUZZ_FREQ 2300
+
+// Drive the D12 passive buzzer on/off via tone() (an AC waveform — required for
+// passive buzzers; a plain digitalWrite HIGH stays silent). The pin7 relay
+// mirrors the same on/off level when the external sounder is enabled.
+void setBuzz(bool on) {
+  if (on) tone(BUZZ_PIN, BUZZ_FREQ);
+  else { noTone(BUZZ_PIN); digitalWrite(BUZZ_PIN, LOW); }
+  digitalWrite(RELAY_PIN, (extBuzz && on) ? HIGH : LOW);
+}
 
 String inputBuffer = "";
 String pendingFanCommand = "";
@@ -77,6 +103,20 @@ void processCommand(String receivedData) {
     if (m < 0) m = 0; if (m > 3) m = 3;
     buzzMode = m;
   }
+  else if (receivedData.startsWith("EXTBUZZ:")) {
+    int v = receivedData.substring(8).toInt();
+    extBuzz = (v != 0);
+    if (!extBuzz) digitalWrite(RELAY_PIN, LOW);   // disable -> drop relay now
+  }
+  else if (receivedData.startsWith("TESTBUZZ:")) {
+    String a = receivedData.substring(9);
+    if (a == "off" || a == "OFF" || a == "x") { testAlarm = false; }
+    else {
+      int m = a.toInt();
+      if (m < 0) m = 0; if (m > 3) m = 3;
+      buzzMode = m; buzzPhase = 0; testAlarm = true;
+    }
+  }
   else if (receivedData == "restart")     resetFunc();
 }
 
@@ -95,7 +135,7 @@ void handleSerial() {
 
 void handleAlarmBlink() {
   if (!isAlarm) {
-    digitalWrite(7, LOW);
+    setBuzz(false);   // also drives pin7 relay LOW
     ledState = LOW;
     buzzPhase = 0;
     previousMillis = millis();
@@ -104,22 +144,22 @@ void handleAlarmBlink() {
   unsigned long now = millis();
   switch (buzzMode) {
     case 0:  // ต่อเนื่อง
-      digitalWrite(7, HIGH);
+      setBuzz(true);
       ledState = HIGH;
       break;
     case 2:  // กระพริบเร็ว 150ms
-      if (now - previousMillis >= 150) { previousMillis = now; ledState = !ledState; digitalWrite(7, ledState); }
+      if (now - previousMillis >= 150) { previousMillis = now; ledState = !ledState; setBuzz(ledState); }
       break;
     case 3: {  // บี๊บคู่: on120 off120 on120 off600
       static const unsigned int durs[4] = {120, 120, 120, 600};
       static const uint8_t   lvls[4] = {HIGH, LOW, HIGH, LOW};
-      digitalWrite(7, lvls[buzzPhase]);
+      setBuzz(lvls[buzzPhase]);
       if (now - previousMillis >= durs[buzzPhase]) { previousMillis = now; buzzPhase = (buzzPhase + 1) & 3; }
       break;
     }
     case 1:  // กระพริบช้า 500ms (default)
     default:
-      if (now - previousMillis >= 500) { previousMillis = now; ledState = !ledState; digitalWrite(7, ledState); }
+      if (now - previousMillis >= 500) { previousMillis = now; ledState = !ledState; setBuzz(ledState); }
       break;
   }
 }
@@ -133,6 +173,7 @@ void setup() {
   pinMode(6, OUTPUT);
   pinMode(7, OUTPUT);
   pinMode(8, OUTPUT);
+  pinMode(BUZZ_PIN, OUTPUT);   // D12 passive buzzer
   pinMode(input_alarm_1, INPUT);
   pinMode(input_alarm_2, INPUT);
   pinMode(input_alarm_3, INPUT);
@@ -150,6 +191,6 @@ void loop() {
     pendingFanCommand = "";
   }
 
-  isAlarm = (state == true && warring == true);
+  isAlarm = (state == true && warring == true) || testAlarm;
   handleAlarmBlink();
 }

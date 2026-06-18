@@ -789,6 +789,16 @@ int btn_home, btn_time, btn_light, btn_fan, btn_high, btn_pump, btn_spray, btn_e
 char timeStr[10];
 char ddmmyy[12];
 char dayweek[12];
+
+// Cached RTC timestamp (ISO) — updated only in the loop task (timer()), read by the
+// BLE notify (bleBuildStatus). Avoids calling rtc.now() / touching I2C from the NimBLE
+// callback task concurrently with the loop, which corrupts I2C reads (= jumpy time).
+volatile char g_timeIso[24] = "2000-01-01 00:00:00";
+
+// RTC set request from the BLE task — applied in the loop task so the I2C write to the
+// DS3231 never races a loop-side rtc.now() read. Order: d, m, y, h, mn.
+volatile bool g_rtcSetPending = false;
+volatile int  g_rtcSet[5] = {0};
 lv_obj_t* lastScreen = nullptr;
 int currentDayIndex = 0; 
 int currentSlotIndex = 0; 
@@ -945,6 +955,11 @@ void readWind() {
         // เพิ่งเปิดพัดลม → คืน buzzer state ตามค่า isMuteOpen ปัจจุบัน (ยังไม่แตะ led1 — รอ warm-up)
         Serial2.println(isMuteOpen ? "Mute: OPEN" : "Mute: CLOSE");
         Serial2.print("BUZZ:"); Serial2.println(buzz_mode);   // re-sync pattern เผื่อ Nano reset ระหว่างทาง
+        Serial2.print("EXTBUZZ:"); Serial2.println(ext_buzz); // re-sync ext buzzer state เผื่อ Nano reset
+        // buzzer ต้องมา "หลัง" sensor ทำงาน → เคลียร์ alarm ลมตกที่ค้างจากรอบก่อน
+        // ส่ง WIND_HIGH (Nano state=false → เงียบ) + reset เพื่อให้ประเมินใหม่หลัง warm-up เท่านั้น
+        Serial2.println("WIND_HIGH");
+        is_wind_zero_state = false;
         fanOnTime = millis();   // เริ่มจับเวลา warm-up 5 วิ ก่อนเริ่มอ่าน/แสดงค่า
     }
     wasFanOff = false;
@@ -969,7 +984,6 @@ void readWind() {
         previousMillisWind = currentMillis;
 
         int windADunits = analogRead(OutPin);
- 
 
         windMPH = pow((((float)windADunits - 264.0) / 85.6814), 3.36814);
         windMS = windMPH * 0.44704; 
@@ -998,21 +1012,23 @@ void readWind() {
     smoothedWindMs = (smoothedWindMs * (1.0 - filterFactor)) + (windms * filterFactor);
     smoothedWindFt = (smoothedWindFt * (1.0 - filterFactor)) + (windFtPerMin * filterFactor);
 
-    // ----- Local LED (led1 / GPIO1): ติดตาม wind threshold เท่านั้น -----
-    // - fan ปิด → INPUT (จัดการที่ gate ด้านบน)
-    // - ลม < threshold → OUTPUT HIGH ติดค้าง (เตือนลมตก)
-    // - ลม >= threshold → OUTPUT LOW (ลมแรงพอ)
+    // ----- Local LED (led1 / GPIO1): หลอด 2 สีคุมด้วยขาเดียว -----
+    // - fan ปิด / warm-up → INPUT (high-Z) → ดับสนิท
+    // - ลม < threshold (ลมตก) → OUTPUT HIGH → หลอดแดง (เตือน)
+    // - ลม >= threshold (ลมพอ) → OUTPUT LOW → หลอดเขียว (ปกติ)
     // (silen ไม่มีผลต่อ LED — ปิดแค่เสียง buzzer เท่านั้น)
-    // หมายเหตุ: ไม่เรียก pinMode ทุก 30ms — ตั้งครั้งเดียวตอนเปลี่ยนจาก INPUT → OUTPUT
-    if (!led1_is_output) {
-        pinMode(led1, OUTPUT);   // ผ่าน warm-up แล้ว → คืน led1 เป็น OUTPUT เริ่มคุมไฟ
-        led1_is_output = true;
-    }
+    // หมายเหตุ: ไม่เรียก pinMode ทุก 30ms — ตั้งเฉพาะตอนเปลี่ยน mode
+    // last_led1 = -1 ตอนกลับมา OUTPUT → force digitalWrite ใหม่เสมอ (กัน output latch
+    // ค้างค่าเก่าหลังช่วง INPUT ของ fan-off/warm-up)
     static int8_t last_led1 = -1;
-    int8_t want = (smoothedWindMs < alert_set) ? HIGH : LOW;
-    if (want != last_led1) {
-        digitalWrite(led1, want);
-        last_led1 = want;
+    if (smoothedWindMs < alert_set) {
+        // ลมตก → หลอดแดง (OUTPUT HIGH ติดค้าง)
+        if (!led1_is_output) { pinMode(led1, OUTPUT); led1_is_output = true; last_led1 = -1; }
+        if (last_led1 != HIGH) { digitalWrite(led1, HIGH); last_led1 = HIGH; }
+    } else {
+        // ลมแรงพอ → หลอดเขียว (OUTPUT LOW ติดค้าง)
+        if (!led1_is_output) { pinMode(led1, OUTPUT); led1_is_output = true; last_led1 = -1; }
+        if (last_led1 != LOW) { digitalWrite(led1, LOW); last_led1 = LOW; }
     }
 
     // ----- WIND_LOW / WIND_HIGH → Nano (คุม LED pin 7 + Buzzer) -----
@@ -1167,8 +1183,12 @@ void timer() {
     }
     lastTimerUpdate = millis();
 
-    DateTime now = rtc.now(); 
+    DateTime now = rtc.now();
     int dayOfWeekIndex = now.dayOfTheWeek();
+
+    // อัปเดต cache ISO ให้ BLE notify อ่าน (ไม่ให้ BLE task แตะ I2C เอง)
+    snprintf((char*)g_timeIso, sizeof(g_timeIso), "%04d-%02d-%02d %02d:%02d:%02d",
+             now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second());
 
     sprintf(timeStr, "%02d:%02d", now.hour(), now.minute());
     sprintf(ddmmyy, "%02d/%02d/%04d", now.day(), now.month(), now.year());
@@ -2738,9 +2758,11 @@ static void bleHandleCommand(const String& raw) {
         if (n == 5 && t[0] >= 2024 && t[1] >= 1 && t[1] <= 12
             && t[3] >= 0 && t[3] <= 23 && t[4] >= 0 && t[4] <= 59
             && t[2] >= 1 && t[2] <= daysInMonth(t[0], t[1])) {
-            saveTimeSettings(t[2], t[1], t[0], t[3], t[4]);   // (d, m, y, h, mn) → RTC + NVS
-            Serial.printf("[BLE] RTC set %04d-%02d-%02d %02d:%02d\n", t[0], t[1], t[2], t[3], t[4]);
-            bleNotify();                                       // ส่งเวลาใหม่กลับ
+            // defer การเขียน RTC ไป loop task (กัน I2C write ชน loop read)
+            g_rtcSet[0] = t[2]; g_rtcSet[1] = t[1]; g_rtcSet[2] = t[0];
+            g_rtcSet[3] = t[3]; g_rtcSet[4] = t[4];
+            g_rtcSetPending = true;
+            Serial.printf("[BLE] RTC set %04d-%02d-%02d %02d:%02d (queued)\n", t[0], t[1], t[2], t[3], t[4]);
         } else Serial.printf("[BLE] RTC bad: %s\n", val.c_str());
         return;
     }
@@ -2789,6 +2811,14 @@ static void bleHandleCommand(const String& raw) {
         saveBuzzMode(val.toInt());                // clamp + เก็บ NVS
         Serial2.print("BUZZ:"); Serial2.println(buzz_mode);   // forward ไป Nano
         Serial.printf("[BLE] BUZZ -> %d\n", buzz_mode);
+        bleNotify();                              // ส่ง status ใหม่กลับให้ web sync
+        return;
+    }
+
+    if (key == "EXTBUZZ") {                       // เปิด/ปิด buzzer ภายนอก (relay pin7) — setting, ไม่ต้องเข้า control mode
+        saveExtBuzz(val.toInt());                 // 0/1 + เก็บ NVS
+        Serial2.print("EXTBUZZ:"); Serial2.println(ext_buzz); // forward ไป Nano
+        Serial.printf("[BLE] EXTBUZZ -> %d\n", ext_buzz);
         bleNotify();                              // ส่ง status ใหม่กลับให้ web sync
         return;
     }
@@ -2848,18 +2878,19 @@ static String bleBuildStatus() {
     j += "\"speed\":"   + String(chk(objects.speed))   + ",";
     j += "\"mode\":"    + String(chk(objects.mode))    + ",";
     j += "\"silen\":"   + String(silen ? 1 : 0)        + ",";
-    j += "\"windMs\":"  + String(smoothedWindMs, 2)    + ",";
-    j += "\"windFt\":"  + String(smoothedWindFt, 1)    + ",";
+    j += "\"windMs\":"  + String(smoothedWindMs, 2)    + ",";   // windFt = windMs*196.85 (web คำนวณเอง — JSON สั้น กัน notify เกิน MTU)
     j += "\"alarm1\":"  + String(alarm_active[0] ? 1 : 0) + ",";
     j += "\"alarm2\":"  + String(alarm_active[1] ? 1 : 0) + ",";
     j += "\"alarm3\":"  + String(alarm_active[2] ? 1 : 0) + ",";
-    DateTime n = rtc.now();
+    // อ่านเวลาจาก cache (อัปเดตใน loop task) — ห้ามเรียก rtc.now() ที่นี่ เพราะฟังก์ชันนี้
+    // ถูกเรียกจาก NimBLE callback task ด้วย → I2C ชนกับ loop = เวลาเพี้ยน
     char tb[24];
-    snprintf(tb, sizeof(tb), "%04d-%02d-%02d %02d:%02d:%02d",
-             n.year(), n.month(), n.day(), n.hour(), n.minute(), n.second());
+    strncpy(tb, (const char*)g_timeIso, sizeof(tb) - 1);
+    tb[sizeof(tb) - 1] = '\0';
     j += "\"time\":\"" + String(tb) + "\",";
     j += "\"ctrl\":"    + String(bleControlMode ? 1 : 0) + ",";
-    j += "\"buzz\":"    + String(buzz_mode);
+    j += "\"buzz\":"    + String(buzz_mode) + ",";
+    j += "\"extbuzz\":" + String(ext_buzz);
     j += "}";
     return j;
 }
@@ -2873,7 +2904,7 @@ static void bleNotify() {
 void bleSetup() {
     String name = String("FumHood-") + deviceId;
     NimBLEDevice::init(name.c_str());
-    NimBLEDevice::setMTU(185);   // notify ยาวพอสำหรับ schedule slot JSON
+    NimBLEDevice::setMTU(247);   // notify payload = MTU-3 = 244B. status JSON ~186B (มี buzz/extbuzz) เกิน 182 ของ MTU 185 เดิม → ถูกตัด → web parse fail. 247 = ค่ามาตรฐานที่ Chrome/Android negotiate
     NimBLEServer* server = NimBLEDevice::createServer();
     server->setCallbacks(new BleServerCb());
     NimBLEService* svc = server->createService(BLE_SVC_UUID);
@@ -3397,6 +3428,8 @@ void setup()
     loadCalibration();
     loadBuzzMode();                          // โหลด buzzer pattern จาก NVS
     Serial2.print("BUZZ:"); Serial2.println(buzz_mode);   // sync ให้ Nano ตั้งแต่ boot
+    loadExtBuzz();                           // โหลดสถานะ buzzer ภายนอก (relay pin7) จาก NVS
+    Serial2.print("EXTBUZZ:"); Serial2.println(ext_buzz); // sync ให้ Nano ตั้งแต่ boot
     Wire.begin(8, 9);
     for (int i = 0; i < numLeds; i++) {
     pinMode(leds[i], OUTPUT);
@@ -3595,6 +3628,10 @@ void loop(){
         // ï¿½ï¿½Ç¹ï¿½Í§ï¿½ï¿½Ã¨Ñ´ï¿½ï¿½ï¿½Ë¹ï¿½Ò¨ï¿½ï¿½ï¿½Ñ¡ï¿½ï¿½Ð¿Ñ§ï¿½ï¿½ï¿½Ñ¹ï¿½ï¿½ï¿½ï¿½ï¿½Í§ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Í¹ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
     if (millis() - lastRTC >= 1000) {
         lastRTC = millis();
+        if (g_rtcSetPending) {   // ใช้คำสั่งตั้งเวลาที่ BLE task คิวไว้ — เขียน I2C ใน loop task
+            g_rtcSetPending = false;
+            saveTimeSettings(g_rtcSet[0], g_rtcSet[1], g_rtcSet[2], g_rtcSet[3], g_rtcSet[4]);
+        }
         timer();
         // [APP CONTROL] เรียกทุกหน้า เพื่อให้รับ/ส่งคำสั่ง appControlMode ได้แม้ไม่ได้อยู่หน้า MAIN
 #if !BLE_ONLY

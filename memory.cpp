@@ -212,6 +212,29 @@ void loadBuzzMode() {
     }
 }
 
+int ext_buzz = 0;   // external sounder on relay pin7 — 0=off (default) 1=on
+
+// บันทึกสถานะ buzzer ภายนอก (relay pin7) — ตั้งผ่านเว็บ → จำใน NVS
+void saveExtBuzz(int on) {
+    ext_buzz = on ? 1 : 0;
+    if (prefs.begin("settings", false)) {
+        prefs.putInt("ext_buzz", ext_buzz);
+        prefs.end();
+        Serial2.printf("[System] Ext Buzz Saved: %d\n", ext_buzz);
+    } else {
+        Serial2.println("[Error] Cannot open NVS for ext_buzz");
+    }
+}
+
+// โหลดสถานะ buzzer ภายนอก (เรียกใน setup)
+void loadExtBuzz() {
+    if (prefs.begin("settings", true)) {
+        ext_buzz = prefs.getInt("ext_buzz", 0);   // default = 0 (off)
+        prefs.end();
+        Serial2.printf("[System] Ext Buzz Loaded: %d\n", ext_buzz);
+    }
+}
+
 void createMockProgramData() {
     Serial.println("[NVS] Generating Mock Data for 7 Days...");
 
